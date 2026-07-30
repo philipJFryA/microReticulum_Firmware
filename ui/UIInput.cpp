@@ -20,8 +20,8 @@ constexpr gpio_num_t PIN_KB_INT   = GPIO_NUM_46;  // keyboard interrupt
 
 constexpr uint8_t KB_I2C_ADDR     = 0x55;
 constexpr uint8_t TB_DEBOUNCE_MS  = 20;
-constexpr uint8_t TB_REPEAT_MS    = 350;
-constexpr uint8_t TB_REPEAT_INIT  = 500;  // initial repeat delay
+constexpr uint16_t TB_REPEAT_MS    = 350;
+constexpr uint16_t TB_REPEAT_INIT  = 500;  // initial repeat delay
 
 // ── volatile state (ISR‑safe) ─────────────────────────────────────────
 static volatile uint8_t  tb_flags    = 0;
@@ -154,7 +154,7 @@ uint8_t getLastKey() {
 void poll() {
   // Keyboard I²C read (triggered by INT pin LOW)
   if (digitalRead(PIN_KB_INT) == LOW) {
-    Wire.requestFrom(KB_I2C_ADDR, 1);
+    Wire.requestFrom((uint8_t)KB_I2C_ADDR, (uint8_t)1);
     if (Wire.available()) {
       uint8_t c = Wire.read();
       kb_last_key = c;
@@ -177,16 +177,21 @@ void init() {
   pinMode(PIN_TB_RIGHT, INPUT_PULLUP);
   // PIN_TB_PRESS (GPIO 0) already pulled up by BOOT button circuit
 
-  attachInterrupt(digitalPinToInterrupt(PIN_TB_UP),    isr_tb_up,    FALLING);
-  attachInterrupt(digitalPinToInterrupt(PIN_TB_DOWN),  isr_tb_down,  FALLING);
-  attachInterrupt(digitalPinToInterrupt(PIN_TB_LEFT),  isr_tb_left,  FALLING);
-  attachInterrupt(digitalPinToInterrupt(PIN_TB_RIGHT), isr_tb_right, FALLING);
-  attachInterrupt(digitalPinToInterrupt(PIN_TB_PRESS), isr_tb_press, FALLING);
+
+  attachInterrupt((int)PIN_TB_UP,    isr_tb_up,    FALLING);
+  attachInterrupt((int)PIN_TB_DOWN,  isr_tb_down,  FALLING);
+
+  attachInterrupt((int)PIN_TB_LEFT,  isr_tb_left,  FALLING);
+
+  attachInterrupt((int)PIN_TB_RIGHT, isr_tb_right, FALLING);
+
+  attachInterrupt((int)PIN_TB_PRESS, isr_tb_press, FALLING);
 
   // ── keyboard I²C ─────────────────────────────────────────────────
   Wire.begin(18, 8);  // SDA=18, SCL=8
   pinMode(PIN_KB_INT, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(PIN_KB_INT), isr_kb_int, FALLING);
+
+  attachInterrupt((int)PIN_KB_INT, isr_kb_int, FALLING);
 
   // ── register LVGL indevs ─────────────────────────────────────────
   static lv_indev_drv_t drv_keypad;

@@ -30,7 +30,6 @@ void init() {
   lv_style_set_bg_color(&style_screen, DARK_BG);
   lv_style_set_bg_opa(&style_screen, LV_OPA_COVER);
   lv_style_set_pad_all(&style_screen, 0);
-  lv_style_set_margin_all(&style_screen, 0);
 
   // ── card ───────────────────────────────────────────────────────
   lv_style_init(&style_card);

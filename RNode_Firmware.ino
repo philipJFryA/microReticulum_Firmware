@@ -41,9 +41,9 @@
 #include "Platform.h"
 #include "WebSocketConsole.h"
 
-#ifdef BOARD_TDECK
-  #include "ui/UISystem.h"
-#endif
+#if BOARD_MODEL == BOARD_TDECK
+    #include "ui/UISystem.h"
+  #endif
 
 #if MODEM == MODEM_RUNTIME
 #include "native/LoRaFactory.h"
@@ -555,7 +555,7 @@ void setup() {
 
       pinMode(DISPLAY_BL_PIN, OUTPUT);
 
-      #ifdef BOARD_TDECK
+      #if BOARD_MODEL == BOARD_TDECK
         td_ui::begin();
       #endif
     #endif
@@ -2764,7 +2764,7 @@ void loop() {
     if (disp_ready && !display_updating) update_display();
   #endif
 
-  #ifdef BOARD_TDECK
+  #if BOARD_MODEL == BOARD_TDECK
     td_ui::update();
   #endif
 

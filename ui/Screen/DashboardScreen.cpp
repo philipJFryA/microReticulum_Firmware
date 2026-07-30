@@ -1,6 +1,7 @@
 // Copyright (C) 2024, Mark Qvist
 // T-Deck dashboard implementation
 
+#include <Arduino.h>
 #include "DashboardScreen.h"
 #include "../UITheme.h"
 #include "ScreenBuilder.h"

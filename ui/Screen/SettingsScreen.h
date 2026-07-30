@@ -15,6 +15,10 @@ public:
   void leave() override;
 
 private:
+  // friend declarations for static event handlers
+  friend void onTxpSliderChanged(lv_event_t *e);
+  friend void onBlSliderChanged(lv_event_t *e);
+  friend void onRebootClicked(lv_event_t *e);
   lv_obj_t *titleLabel;
 
   // frequency

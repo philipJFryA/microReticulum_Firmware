@@ -1,6 +1,7 @@
 // Copyright (C) 2024, Mark Qvist
 // T-Deck settings screen implementation
 
+#include <Arduino.h>
 #include "SettingsScreen.h"
 #include "../UITheme.h"
 #include "ScreenBuilder.h"
@@ -30,7 +31,7 @@ extern void request_restart();
 static constexpr float bw_values[] = { 7.8f, 10.4f, 15.6f, 20.8f, 31.25f, 41.7f, 62.5f, 125.0f, 250.0f, 500.0f };
 static constexpr uint8_t bw_count = sizeof(bw_values) / sizeof(bw_values[0]);
 
-// ── frequency bounds (MHz × 100 for slider integer range) ────────────
+// ── frequency bounds (MHz x 100 for slider integer range) ────────────
 static constexpr int32_t FREQ_MIN = 41000;   // 410.00 MHz
 static constexpr int32_t FREQ_MAX = 96000;   // 960.00 MHz
 static constexpr int32_t TXP_MIN  = -20;
@@ -48,8 +49,44 @@ static int findBwIndex(float bw) {
 
 // Clamp a dropdown index to valid range
 static uint8_t clampBwIdx(uint8_t idx) { return (idx < bw_count) ? idx : 7; }
-static uint8_t clampSfIdx(uint8_t idx) { return (idx < 6) ? idx : 0; }    // 0-5 → SF7-SF12
-static uint8_t clampCrIdx(uint8_t idx) { return (idx < 4) ? idx : 0; }    // 0-3 → 4/5-4/8
+static uint8_t clampSfIdx(uint8_t idx) { return (idx < 6) ? idx : 0; }    // 0-5 -> SF7-SF12
+static uint8_t clampCrIdx(uint8_t idx) { return (idx < 4) ? idx : 0; }    // 0-3 -> 4/5-4/8
+
+// ── static event handlers ────────────────────────────────────────────
+static void onFreqSliderChanged(lv_event_t *e) {
+  (void)e;
+}
+
+void onTxpSliderChanged(lv_event_t *e) {
+  lv_obj_t *slider = (lv_obj_t*)lv_event_get_target(e);
+  if (!slider) return;
+  int32_t v = lv_slider_get_value(slider);
+  if (v < TXP_MIN) v = TXP_MIN;
+  if (v > TXP_MAX) v = TXP_MAX;
+  SettingsScreen *self = (SettingsScreen*)lv_event_get_user_data(e);
+  if (!self || !self->txpLabel || !lv_obj_is_valid(self->txpLabel)) return;
+  char b[32];
+  snprintf(b, sizeof(b), "%d dBm", (int)v);
+  lv_label_set_text(self->txpLabel, b);
+}
+
+void onBlSliderChanged(lv_event_t *e) {
+  lv_obj_t *slider = (lv_obj_t*)lv_event_get_target(e);
+  if (!slider) return;
+  int32_t v = lv_slider_get_value(slider);
+  if (v < BL_MIN) v = BL_MIN;
+  if (v > BL_MAX) v = BL_MAX;
+  SettingsScreen *self = (SettingsScreen*)lv_event_get_user_data(e);
+  if (!self || !self->blLabel || !lv_obj_is_valid(self->blLabel)) return;
+  char b[32];
+  snprintf(b, sizeof(b), "%d/15", (int)v);
+  lv_label_set_text(self->blLabel, b);
+}
+
+void onRebootClicked(lv_event_t *e) {
+  (void)e;
+  request_restart();
+}
 
 // ── create ────────────────────────────────────────────────────────────
 void SettingsScreen::create(lv_obj_t *parent) {
@@ -87,16 +124,7 @@ void SettingsScreen::create(lv_obj_t *parent) {
   snprintf(buf, sizeof(buf), "%.2f MHz", lora_freq);
   lv_label_set_text(freqLabel, buf);
 
-  lv_obj_add_event_cb(freqSlider, [](lv_event_t *e) {
-    lv_obj_t *slider = (lv_obj_t*)lv_event_get_target(e);
-    if (!slider) return;
-    int32_t v = lv_slider_get_value(slider);
-    if (v < FREQ_MIN) v = FREQ_MIN;
-    if (v > FREQ_MAX) v = FREQ_MAX;
-    char b[32];
-    snprintf(b, sizeof(b), "%.2f MHz", v / 100.0f);
-    if (freqLabel && lv_obj_is_valid(freqLabel)) lv_label_set_text(freqLabel, b);
-  }, LV_EVENT_VALUE_CHANGED, nullptr);
+  lv_obj_add_event_cb(freqSlider, onFreqSliderChanged, LV_EVENT_VALUE_CHANGED, nullptr);
 
   // bandwidth dropdown (factory sets row, label, dd styles)
   addDropdownRow(sec1, ROW_W, "Bandwidth", DD_W_LG, bwDropdown);
@@ -131,16 +159,7 @@ void SettingsScreen::create(lv_obj_t *parent) {
   snprintf(buf, sizeof(buf), "%d dBm", lora_txp);
   lv_label_set_text(txpLabel, buf);
 
-  lv_obj_add_event_cb(txpSlider, [](lv_event_t *e) {
-    lv_obj_t *slider = (lv_obj_t*)lv_event_get_target(e);
-    if (!slider) return;
-    int32_t v = lv_slider_get_value(slider);
-    if (v < TXP_MIN) v = TXP_MIN;
-    if (v > TXP_MAX) v = TXP_MAX;
-    char b[32];
-    snprintf(b, sizeof(b), "%d dBm", (int)v);
-    if (txpLabel && lv_obj_is_valid(txpLabel)) lv_label_set_text(txpLabel, b);
-  }, LV_EVENT_VALUE_CHANGED, nullptr);
+  lv_obj_add_event_cb(txpSlider, onTxpSliderChanged, LV_EVENT_VALUE_CHANGED, this);
 
   // ── display section ───────────────────────────────────────────────
   lv_obj_t *sec2 = addSection(cont, SECTION_W, "Display");
@@ -148,17 +167,7 @@ void SettingsScreen::create(lv_obj_t *parent) {
   lv_slider_set_value(blSlider, display_intensity, LV_ANIM_OFF);
   snprintf(buf, sizeof(buf), "%u/15", display_intensity);
   lv_label_set_text(blLabel, buf);
-
-  lv_obj_add_event_cb(blSlider, [](lv_event_t *e) {
-    lv_obj_t *slider = (lv_obj_t*)lv_event_get_target(e);
-    if (!slider) return;
-    int32_t v = lv_slider_get_value(slider);
-    if (v < BL_MIN) v = BL_MIN;
-    if (v > BL_MAX) v = BL_MAX;
-    char b[32];
-    snprintf(b, sizeof(b), "%d/15", (int)v);
-    if (blLabel && lv_obj_is_valid(blLabel)) lv_label_set_text(blLabel, b);
-  }, LV_EVENT_VALUE_CHANGED, nullptr);
+  lv_obj_add_event_cb(blSlider, onBlSliderChanged, LV_EVENT_VALUE_CHANGED, this);
 
   // ── system section ────────────────────────────────────────────────
   lv_obj_t *sec3 = addSection(cont, SECTION_W, "System");
@@ -171,9 +180,7 @@ void SettingsScreen::create(lv_obj_t *parent) {
   lv_label_set_text(rebootLbl, "Reboot");
   lv_obj_center(rebootLbl);
 
-  lv_obj_add_event_cb(rebootBtn, [](lv_event_t *e) {
-    request_restart();
-  }, LV_EVENT_CLICKED, nullptr);
+  lv_obj_add_event_cb(rebootBtn, onRebootClicked, LV_EVENT_CLICKED, nullptr);
 }
 
 // ── apply changed values ──────────────────────────────────────────────

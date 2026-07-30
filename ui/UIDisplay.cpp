@@ -5,6 +5,8 @@
 
 #ifdef BOARD_TDECK
 
+#include <Arduino.h>
+#include "Boards.h"
 #include <Arduino_GFX_Library.h>
 
 namespace td_display {

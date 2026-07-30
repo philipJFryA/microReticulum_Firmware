@@ -1,6 +1,7 @@
 // Copyright (C) 2024, Mark Qvist
 // T-Deck log screen implementation
 
+#include <Arduino.h>
 #include "LogScreen.h"
 #include "../UITheme.h"
 

@@ -1,6 +1,7 @@
 // Copyright (C) 2024, Mark Qvist
 // T-Deck messages screen implementation
 
+#include <Arduino.h>
 #include "MessagesScreen.h"
 #include "../UITheme.h"
 
