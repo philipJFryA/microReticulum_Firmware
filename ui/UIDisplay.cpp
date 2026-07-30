@@ -14,7 +14,7 @@ namespace td_display {
 const int WIDTH  = 320;
 const int HEIGHT = 240;
 
-// ── global handles ────────────────────────────────────────────────────
+// global handles
 static Arduino_DataBus *bus  = nullptr;
 static Arduino_GFX     *gfx  = nullptr;
 
@@ -22,9 +22,8 @@ lv_color_t *drawBuf1 = nullptr;
 lv_color_t *drawBuf2 = nullptr;
 static lv_disp_draw_buf_t draw_buf;
 
-// ── backlight PWM ─────────────────────────────────────────────────────
+// backlight PWM - matches set_contrast in Display.h
 void setBacklight(uint8_t level) {
-  // Uses the same bit‑banged approach as Display.h’s set_contrast
   static uint8_t cur = 0;
   constexpr uint8_t steps = 16;
 
@@ -50,7 +49,7 @@ void setBacklight(uint8_t level) {
   cur = level;
 }
 
-// ── LVGL flush callback ───────────────────────────────────────────────
+// LVGL flush callback
 void flushCb(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
   if (!gfx) {
     lv_disp_flush_ready(disp);
@@ -65,21 +64,25 @@ void flushCb(lv_disp_drv_t *disp, const lv_area_t *area, lv_color_t *color_p) {
   lv_disp_flush_ready(disp);
 }
 
-// ── initialisation ────────────────────────────────────────────────────
+// initialisation
 bool init() {
-  // SPI bus already configured by the main firmware (same MOSI/CLK as LoRa)
+  // T-Deck display shares SPI pins (CLK=40, MOSI=41, MISO=38) with the
+  // LoRa radio on different CS.  The original firmware (Display.h) uses
+  // software SPI via Adafruit_ST7789(CS, DC, RST) to avoid driver-level
+  // conflicts on the shared bus.  Arduino_GFX's Arduino_SoftwareSPI bus
+  // achieves the same thing.
 
   pinMode(DISPLAY_DC, OUTPUT);
   pinMode(DISPLAY_CS, OUTPUT);
   pinMode(DISPLAY_BL_PIN, OUTPUT);
   digitalWrite(DISPLAY_CS, HIGH);
-  digitalWrite(DISPLAY_BL_PIN, LOW);
+  digitalWrite(DISPLAY_BL_PIN, HIGH);   // backlight ON before init
+  delay(10);
 
-  bus = new Arduino_ESP32SPI(
+  // Use software SPI to avoid conflicting with LoRa on shared SPI pins
+  bus = new Arduino_SWSPI(
       DISPLAY_DC, DISPLAY_CS,
-      DISPLAY_CLK, DISPLAY_MOSI, DISPLAY_MISO,
-      HSPI,        // Use SPI2 so it won't conflict with LoRa on SPI (FSPI)
-      true);       // auto-flush DMA
+      DISPLAY_CLK, DISPLAY_MOSI, DISPLAY_MISO);
 
   if (!bus->begin()) return false;
 
@@ -88,13 +91,18 @@ bool init() {
   gfx->begin();
   gfx->fillScreen(BLACK);
 
-  // ── LVGL display driver ──────────────────────────────────────────
+  // Restore original backlight behaviour: bit-banged PWM started at
+  // full brightness (15/15).  The user can adjust it from the settings
+  // screen later.
+  // After init, backlight is ON, we switch to PWM mode at full brightness
+  setBacklight(15);
+
+  // LVGL display driver
   lv_init();
 
   drawBuf1 = (lv_color_t *)ps_malloc(WIDTH * HEIGHT * sizeof(lv_color_t));
   drawBuf2 = (lv_color_t *)ps_malloc(WIDTH * HEIGHT * sizeof(lv_color_t));
   if (!drawBuf1 || !drawBuf2) {
-    // Fall back to single buffer (half size)
     if (drawBuf1) { free(drawBuf1); drawBuf1 = nullptr; }
     if (drawBuf2) { free(drawBuf2); drawBuf2 = nullptr; }
 
