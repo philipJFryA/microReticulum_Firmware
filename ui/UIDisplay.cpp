@@ -79,10 +79,14 @@ bool init() {
   digitalWrite(DISPLAY_BL_PIN, HIGH);   // backlight ON before init
   delay(10);
 
-  // Use software SPI to avoid conflicting with LoRa on shared SPI pins
-  bus = new Arduino_SWSPI(
+  // Use hardware SPI on the default controller (FSPI on ESP32-S3) with
+  // is_shared_interface=true so it doesn't disrupt the LoRa radio on the
+  // same physical bus (shared CLK=40, MOSI=41, MISO=38, different CS).
+  bus = new Arduino_ESP32SPI(
       DISPLAY_DC, DISPLAY_CS,
-      DISPLAY_CLK, DISPLAY_MOSI, DISPLAY_MISO);
+      DISPLAY_CLK, DISPLAY_MOSI, DISPLAY_MISO,
+      HSPI,       // SPI3 bus - free for user peripherals on ESP32-S3
+      true);       // is_shared_interface
 
   if (!bus->begin()) return false;
 
