@@ -41,6 +41,14 @@
 #include "Platform.h"
 #include "WebSocketConsole.h"
 
+// Meshtastic-inspired T-Deck user interface (keyboard + trackball + ST7789).
+// Only active when BOARD_MODEL == BOARD_TDECK; on all other boards this
+// header compiles to nothing. The include sits after Utilities.h because
+// the UI draws through the global `display` object defined by Display.h.
+#if BOARD_MODEL == BOARD_TDECK
+  #include "TDeckUI.h"
+#endif
+
 #if MODEM == MODEM_RUNTIME
 #include "native/LoRaFactory.h"
 #include "native/PinMap.h"
@@ -776,6 +784,13 @@ void setup() {
     display_unblank();
     disp_ready = display_init();
     update_display();
+
+    // The T-Deck UI owns the ST7789 screen, BBQ10 keyboard and trackball.
+    // Initialisation is unconditional (not guarded by TDECKUITEST) — only
+    // the boot-time RGB + input test sequence itself is compile-time gated.
+    #if BOARD_MODEL == BOARD_TDECK
+      tdeck_ui_init();
+    #endif
   #endif
 
   #if MCU_VARIANT == MCU_ESP32 || MCU_VARIANT == MCU_NRF52 || MCU_VARIANT == MCU_NATIVE
@@ -2770,6 +2785,12 @@ void loop() {
 
   #if HAS_INPUT
     input_read();
+  #endif
+
+  // Service the T-Deck UI (keyboard + trackball events, screen refresh,
+  // and the TDECKUITEST-guarded RGB/input test sequence).
+  #if BOARD_MODEL == BOARD_TDECK
+    tdeck_ui_loop();
   #endif
 
   // Feed WDT

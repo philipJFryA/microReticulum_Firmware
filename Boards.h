@@ -662,7 +662,7 @@
       #define HAS_BUSY true
       #define HAS_TCXO true
 
-      #define HAS_DISPLAY false
+      #define HAS_DISPLAY true
       #define HAS_CONSOLE false
       #define HAS_WIFI true
       #define HAS_BLUETOOTH false
@@ -677,8 +677,23 @@
       #define PIN_WAKEUP GPIO_NUM_0
       #define WAKEUP_LEVEL 0
 
-      const int pin_poweron = 10;
-      const int pin_btn_usr1 = 0;
+      // LilyGO T-Deck input peripherals (I2C keyboard + GPIO trackball)
+      #define I2C_SDA 18
+      #define I2C_SCL 8
+      #define KB_POWERON 10
+      #define KB_SLAVE_ADDRESS 0x55
+      #define KB_BL_PIN 46
+      #define TB_UP 3
+      #define TB_DOWN 15
+      #define TB_LEFT 1
+      #define TB_RIGHT 2
+      #define TB_PRESS 0
+      #define TB_DIRECTION FALLING
+      #define TB_THRESHOLD 3
+      #define DISPLAY_SCALE 2
+
+      const int pin_poweron = KB_POWERON;
+      const int pin_btn_usr1 = TB_PRESS;
 
       const int pin_cs = 9;
       const int pin_reset = 17;

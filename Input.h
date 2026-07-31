@@ -15,6 +15,19 @@
 
 #ifndef INPUT_H
   #define INPUT_H
+
+  // On the LilyGO T-Deck, the generic single-button input is superseded by
+  // the dedicated T-Deck UI (TDeckUI.h) which owns the trackball and BBQ10
+  // keyboard. GPIO 0 doubles as both the legacy pin_btn_usr1 and the
+  // trackball centre-press, so the generic button poller must not run or it
+  // would interpret trackball presses as sleep/pairing/console requests.
+  #if BOARD_MODEL == BOARD_TDECK
+    #define input_init()           do {} while (0)
+    #define input_read()           do {} while (0)
+    #define input_get_all_events() do {} while (0)
+    #define input_get_click_events() do {} while (0)
+    #define button_pressed()       false
+  #else
   
   #define PIN_BUTTON pin_btn_usr1
 
@@ -91,5 +104,7 @@
       return false;
     }
   }
+
+  #endif // BOARD_MODEL != BOARD_TDECK
 
 #endif

@@ -241,6 +241,14 @@ void update_area_positions() {
       p_as_x = 64;
       p_as_y = 0;
     }
+  #elif BOARD_MODEL == BOARD_TDECK
+    // The T-Deck UI (TDeckUI.h) owns the full 240x320 screen and renders
+    // directly, so the 64x64 legacy canvases are only used for contrast
+    // calibration and are tucked into the top-left corner.
+    p_ad_x = 0;
+    p_ad_y = 0;
+    p_as_x = 0;
+    p_as_y = 0;
   #else
     if (disp_mode == DISP_MODE_PORTRAIT) {
       p_ad_x = 0 * DISPLAY_SCALE;
@@ -413,8 +421,12 @@ bool display_init() {
     // Don't check if display is actually connected
     if(false) {
     #elif BOARD_MODEL == BOARD_TDECK
+    // The ST7789's init() is fire-and-forget — the driver provides no
+    // status return, so the common if/else chain below is entered through a
+    // constant-false guard (same pattern as T-Echo / Heltec T114).
     display.init(240, 320);
     display.setSPISpeed(80e6);
+    if (false) {
     #elif BOARD_MODEL == BOARD_HELTEC_T114
     display.init();
     // set white as default pixel colour for Heltec T114
@@ -480,8 +492,11 @@ bool display_init() {
           disp_mode = DISP_MODE_LANDSCAPE;
           display.setRotation(0);
         #elif BOARD_MODEL == BOARD_TDECK
+          // The LilyGO T-Deck's ST7789 panel is natively 240x320 portrait.
+          // Rotation 0 presents the display in its native portrait
+          // orientation, which matches the T-Deck UI's drawing surface.
           disp_mode = DISP_MODE_PORTRAIT;
-          display.setRotation(3);
+          display.setRotation(0);
         #elif BOARD_MODEL == BOARD_TECHO
           disp_mode = DISP_MODE_PORTRAIT;
           display.setRotation(3);
@@ -1089,7 +1104,30 @@ bool epd_blanked = false;
   }
 #endif
 
+// Forward declaration — defined in TDeckUI.h. When true, the T-Deck UI owns
+// the display and the legacy 64x64 canvas renderer in this file yields.
+#if BOARD_MODEL == BOARD_TDECK
+  bool tdeck_ui_active();
+#endif
+
 void update_display(bool blank = false) {
+  #if BOARD_MODEL == BOARD_TDECK
+    // The T-Deck UI (TDeckUI.h) takes over the full 240x320 framebuffer.
+    // Only handle backlight/contrast blanking here; skip the legacy canvas
+    // rendering so the two UIs never fight over the SPI bus.
+    if (tdeck_ui_active()) {
+      if (blank) {
+        set_contrast(&display, 0);
+      } else {
+        if (display_contrast != display_intensity) {
+          display_contrast = display_intensity;
+          set_contrast(&display, display_contrast);
+        }
+      }
+      return;
+    }
+  #endif
+
   display_updating = true;
   if (blank == true) {
     last_disp_update = millis()-disp_update_interval-1;
