@@ -9,11 +9,15 @@
 //
 //   * A full-screen RGB test sequence (guarded by TDECKUITEST)
 //   * An input test screen showing keyboard + trackball events
-//   * A compact status UI with radio state, battery, and a scrolling
-//     log of typed characters
+//   * A compact status UI with radio state and battery
+//
+// Frames are composed in an off-screen RGB565 buffer in PSRAM and pushed to
+// the ST7789 in one full-frame SPI burst, eliminating the flicker caused by
+// incremental clears and redraws. The panel only repaints when an input
+// event arrives or the periodic status refresh fires.
 //
 // All hardware initialisation (keyboard, trackball, backlight, I2C) is
-// performed by tdeck_ui_init() and is NOT guarded — only the test
+// performed by tdeck_ui_init() and is NOT guarded - only the test
 // sequence itself is behind #ifdef TDECKUITEST.
 
 #pragma once
@@ -22,8 +26,13 @@
 
 #if BOARD_MODEL == BOARD_TDECK
 
+#include <Adafruit_GFX.h>
+#ifdef ESP_PLATFORM
+  #include <esp_heap_caps.h>
+#endif
+
 #include "TDeckKeyboard.h"
-// Define the trackball implementation only here — TDeckUI.h is included from
+// Define the trackball implementation only here - TDeckUI.h is included from
 // exactly one translation unit (RNode_Firmware.ino), so the global singleton
 // and ISR pointer are defined exactly once in the firmware image.
 #define TDECK_TRACKBALL_IMPLEMENTATION
@@ -34,7 +43,55 @@
 // below (display, SSD1306_BLACK/WHITE, ST77XX_*, radio_online, battery_*)
 // are therefore already defined in this translation unit.
 
-#define TDECK_UI_VERSION "T-Deck UI v1.0"
+// The T-Deck's ST7789 panel is mounted in landscape; the drawing surface is
+// 320x240 (matching display.setRotation(3) configured in Display.h).
+#define TDECK_SCREEN_W 320
+#define TDECK_SCREEN_H 240
+
+// PSRAM-backed RGB565 off-screen frame buffer. Composing each frame here and
+// then pushing it to the panel in a single burst avoids the visible flicker
+// a direct-draw UI produces when it fillScreen()s and repaints. 320*240*2 =
+// 150 KB, comfortably within the T-Deck's 8 MB PSRAM (falls back to internal
+// heap if the PSRAM allocation fails).
+class TDeckCanvas : public Adafruit_GFX {
+  public:
+    TDeckCanvas(uint16_t w, uint16_t h) : Adafruit_GFX(w, h), _w(w), _h(h), _buf(NULL) {}
+    ~TDeckCanvas() {
+        if (_buf) {
+          #ifdef ESP_PLATFORM
+            heap_caps_free(_buf);
+          #else
+            free(_buf);
+          #endif
+        }
+    }
+
+    void allocate() {
+        if (_buf) return;
+        size_t bytes = (size_t)_w * _h * 2;
+      #ifdef ESP_PLATFORM
+        _buf = (uint16_t *)heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+        if (!_buf) _buf = (uint16_t *)malloc(bytes);
+      #else
+        _buf = (uint16_t *)malloc(bytes);
+      #endif
+    }
+
+    bool valid() const { return _buf != NULL; }
+    uint16_t *buf() const { return _buf; }
+
+    void drawPixel(int16_t x, int16_t y, uint16_t color) override {
+        if (!_buf || x < 0 || y < 0 || x >= (int16_t)_w || y >= (int16_t)_h) return;
+        _buf[(int32_t)y * _w + x] = color;
+    }
+
+  private:
+    uint16_t _w;
+    uint16_t _h;
+    uint16_t *_buf;
+};
+
+#define TDECK_UI_VERSION "T-Deck UI v1.1"
 
 // UI states
 #define TDECK_UI_STATE_STATUS  0
@@ -43,8 +100,9 @@
 
 static uint8_t  tdeck_ui_state      = TDECK_UI_STATE_STATUS;
 static bool     tdeck_ui_ready      = false;
+static bool     tdeck_ui_dirty      = true;
 static uint32_t tdeck_ui_last_tick  = 0;
-static uint32_t tdeck_ui_tick_ms    = 100;
+static uint32_t tdeck_ui_tick_ms    = 1000;
 static char     tdeck_ui_status[64] = "Booting...";
 
 // Test sequence state
@@ -73,82 +131,89 @@ static tdeck_input_state_t tdeck_input_state;
 // this from the single RNode_Firmware.ino translation unit).
 static TDeckKeyboard tdeck_kb;
 
+// Off-screen frame buffer; the pixel memory is allocated in tdeck_ui_init().
+static TDeckCanvas tdeck_canvas(TDECK_SCREEN_W, TDECK_SCREEN_H);
+
 // ---- Internal helpers -----------------------------------------------------
 
 static void tdeck_ui_draw_status() {
-    display.fillScreen(SSD1306_BLACK);
+    TDeckCanvas &c = tdeck_canvas;
+    c.fillScreen(SSD1306_BLACK);
 
     // Header bar
-    display.fillRect(0, 0, 240, 24, ST77XX_BLUE);
-    display.setTextColor(ST77XX_WHITE);
-    display.setTextSize(2);
-    display.setCursor(8, 5);
-    display.print("RDECK");
+    c.fillRect(0, 0, TDECK_SCREEN_W, 28, ST77XX_BLUE);
+    c.setTextColor(ST77XX_WHITE);
+    c.setTextSize(2);
+    c.setCursor(8, 6);
+    c.print("RDECK");
 
     // Status line
-    display.setTextColor(ST77XX_WHITE);
-    display.setTextSize(1);
-    display.setCursor(4, 30);
-    display.print("State: ");
+    c.setTextColor(ST77XX_WHITE);
+    c.setTextSize(1);
+    c.setCursor(4, 38);
+    c.print("State: ");
     if (radio_online) {
-        display.print("LoRa ONLINE");
+        c.print("LoRa ONLINE");
     } else {
-        display.print("LoRa standby");
+        c.print("LoRa standby");
     }
 
-    display.setCursor(4, 42);
-    display.print("Batt:  ");
+    c.setCursor(4, 52);
+    c.print("Batt:  ");
     if (battery_ready) {
-        display.printf("%.0f%%", battery_percent);
+        c.printf("%.0f%%", battery_percent);
     } else {
-        display.print("n/a");
+        c.print("n/a");
     }
 
-    display.setCursor(4, 54);
-    display.print("Keys:  ");
-    display.print(tdeck_input_state.key_count);
-    display.setCursor(4, 66);
-    display.print("Track: ");
-    display.print(tdeck_input_state.tb_count);
+    c.setCursor(4, 66);
+    c.print("Keys:  ");
+    c.print(tdeck_input_state.key_count);
+    c.setCursor(4, 80);
+    c.print("Track: ");
+    c.print(tdeck_input_state.tb_count);
 
     // Footer hint
-    display.drawFastHLine(0, 80, 240, ST77XX_WHITE);
-    display.setTextSize(1);
-    display.setCursor(4, 86);
-    display.print("Trackball: scroll/press  Keys: type");
-    display.setTextSize(2);
-    display.setCursor(4, 100);
+    c.drawFastHLine(0, 96, TDECK_SCREEN_W, ST77XX_WHITE);
+    c.setTextSize(1);
+    c.setCursor(4, 102);
+    c.print("Trackball: scroll/press   Keys: type");
+
+    // Status line
+    c.setTextSize(2);
+    c.setCursor(4, 120);
     if (tdeck_ui_status[0] != '\0') {
-        display.print(tdeck_ui_status);
+        c.print(tdeck_ui_status);
     }
 
     #ifdef TDECKUITEST
-    display.setTextSize(1);
-    display.setCursor(4, 118);
-    display.print("[Press key to run input test]");
+    c.setTextSize(1);
+    c.setCursor(4, 150);
+    c.print("[Press key to run input test]");
     #endif
 }
 
 static void tdeck_ui_draw_input() {
-    display.fillScreen(SSD1306_BLACK);
+    TDeckCanvas &c = tdeck_canvas;
+    c.fillScreen(SSD1306_BLACK);
 
-    display.fillRect(0, 0, 240, 24, ST77XX_GREEN);
-    display.setTextColor(ST77XX_BLACK);
-    display.setTextSize(2);
-    display.setCursor(8, 5);
-    display.print("INPUT TEST");
+    c.fillRect(0, 0, TDECK_SCREEN_W, 28, ST77XX_GREEN);
+    c.setTextColor(ST77XX_BLACK);
+    c.setTextSize(2);
+    c.setCursor(8, 6);
+    c.print("INPUT TEST");
 
     // Keyboard area
-    display.setTextColor(ST77XX_WHITE);
-    display.setTextSize(2);
-    display.setCursor(4, 36);
-    display.print("KB: ");
+    c.setTextColor(ST77XX_WHITE);
+    c.setTextSize(2);
+    c.setCursor(4, 40);
+    c.print("KB: ");
     if (tdeck_input_state.last_key >= 0x20 && tdeck_input_state.last_key <= 0x7E) {
-        display.print((char)tdeck_input_state.last_key);
+        c.print((char)tdeck_input_state.last_key);
     } else if (tdeck_input_state.last_key != '\0') {
-        display.print("(mod)");
+        c.print("(mod)");
     } else {
-        display.print("-");
+        c.print("-");
     }
 
     char state_name[16];
@@ -158,13 +223,13 @@ static void tdeck_ui_draw_input() {
         case KB_KEY_STATE_RELEASE:     snprintf(state_name, sizeof(state_name), "RELEASE"); break;
         default:                       snprintf(state_name, sizeof(state_name), "idle"); break;
     }
-    display.setCursor(4, 52);
-    display.print("St:  ");
-    display.print(state_name);
+    c.setCursor(4, 60);
+    c.print("St:  ");
+    c.print(state_name);
 
     // Trackball area
-    display.setCursor(4, 74);
-    display.print("TB:  ");
+    c.setCursor(4, 82);
+    c.print("TB:  ");
     const char *tbn = "--";
     switch (tdeck_input_state.last_tb) {
         case TB_EVENT_UP:         tbn = "UP"; break;
@@ -175,21 +240,21 @@ static void tdeck_ui_draw_input() {
         case TB_EVENT_PRESS_LONG: tbn = "LONG"; break;
         default: break;
     }
-    display.print(tbn);
+    c.print(tbn);
 
     // Counters
-    display.setTextSize(1);
-    display.setCursor(4, 94);
-    display.print("Key count: ");
-    display.print(tdeck_input_state.key_count);
-    display.setCursor(4, 104);
-    display.print("Trackball count: ");
-    display.print(tdeck_input_state.tb_count);
+    c.setTextSize(1);
+    c.setCursor(4, 106);
+    c.print("Key count: ");
+    c.print(tdeck_input_state.key_count);
+    c.setCursor(4, 118);
+    c.print("Trackball count: ");
+    c.print(tdeck_input_state.tb_count);
 
     // Back hint
-    display.drawFastHLine(0, 116, 240, ST77XX_WHITE);
-    display.setCursor(4, 120);
-    display.print("Trackball PRESS = back");
+    c.drawFastHLine(0, 136, TDECK_SCREEN_W, ST77XX_WHITE);
+    c.setCursor(4, 142);
+    c.print("Trackball PRESS = back");
 }
 
 #ifdef TDECKUITEST
@@ -199,6 +264,7 @@ static void tdeck_test_next_step() {
         // Move to the input test screen
         tdeck_ui_state = TDECK_UI_STATE_INPUT;
         tdeck_test_done = true;
+        tdeck_ui_dirty = true;
         return;
     }
     tdeck_test_colours = (tdeck_test_colours + 1) % TDECK_TEST_RGB_STEPS;
@@ -229,11 +295,11 @@ static void tdeck_ui_run_test() {
     if (!tdeck_test_done) {
         tdeck_test_run_rgb();
     }
-    // The input test screen is handled by tdeck_ui_loop()
   #endif
 }
 
 static void tdeck_ui_draw() {
+    if (!tdeck_canvas.valid()) return;
     switch (tdeck_ui_state) {
         case TDECK_UI_STATE_STATUS:
             tdeck_ui_draw_status();
@@ -241,17 +307,13 @@ static void tdeck_ui_draw() {
         case TDECK_UI_STATE_INPUT:
             tdeck_ui_draw_input();
             break;
-        #ifdef TDECKUITEST
-        case TDECK_UI_STATE_TEST:
-            tdeck_ui_run_test();
-            break;
-        #endif
         default:
             tdeck_ui_draw_status();
             break;
     }
-    // Adafruit_ST7789 writes directly to the panel with each drawing call —
-    // no explicit flush is required (unlike the buffered SSD1306/ST7735).
+    // Push the composed frame in one burst - no per-primitive SPI traffic,
+    // so the panel never shows a half-painted frame.
+    display.drawRGBBitmap(0, 0, tdeck_canvas.buf(), TDECK_SCREEN_W, TDECK_SCREEN_H);
 }
 
 static void tdeck_ui_handle_key(char key, uint8_t state) {
@@ -267,6 +329,7 @@ static void tdeck_ui_handle_key(char key, uint8_t state) {
     #ifdef TDECKUITEST
     if (tdeck_ui_state == TDECK_UI_STATE_STATUS && key >= 'a' && key <= 'z' && state == KB_KEY_STATE_PRESS) {
         tdeck_ui_state = TDECK_UI_STATE_INPUT;
+        tdeck_ui_dirty = true;
     }
     #endif
 }
@@ -289,6 +352,7 @@ static void tdeck_ui_handle_trackball(tb_event_t event) {
     // Return to the status screen from input test on a short centre press
     if (tdeck_ui_state == TDECK_UI_STATE_INPUT && event == TB_EVENT_PRESS) {
         tdeck_ui_state = TDECK_UI_STATE_STATUS;
+        tdeck_ui_dirty = true;
     }
 }
 
@@ -306,17 +370,30 @@ void tdeck_ui_init() {
     digitalWrite(KB_POWERON, HIGH);
     delay(50);
 
-    // The T-Deck's keyboard and trackball share the I2C bus with the PMU
+    // The T-Deck's keyboard and PMU share the I2C bus
     Wire.begin(I2C_SDA, I2C_SCL);
 
-    // Start the keyboard (BBQ10 at 0x55)
+    // Start the keyboard. TDeckKeyboard auto-detects whether the unit has
+    // the ESP32-C3 "T-Keyboard" byte-stream controller or a direct BBQ10.
     tdeck_kb.begin(&Wire);
+    Serial.print("[TDeck] keyboard: ");
+    switch (tdeck_kb.protocol()) {
+        case 1: Serial.println("BBQ10 registers"); break;
+        case 2: Serial.println("ESP32-C3 byte-stream"); break;
+        default: Serial.println("not detected"); break;
+    }
 
     // Start the trackball GPIO interrupts
     tdeck_trackball.begin();
 
     // Set a sensible keyboard backlight
     tdeck_kb.setBacklight(64);
+
+    // Allocate the off-screen frame buffer (PSRAM-backed)
+    tdeck_canvas.allocate();
+    if (!tdeck_canvas.valid()) {
+        Serial.println("[TDeck] warning: could not allocate frame buffer");
+    }
 
     // Select the initial UI state: the status screen by default, or the
     // test sequence when built with TDECKUITEST.
@@ -331,28 +408,45 @@ void tdeck_ui_init() {
     #endif
 
     tdeck_ui_ready = true;
+    tdeck_ui_dirty = true;
+    tdeck_ui_last_tick = millis();
     snprintf(tdeck_ui_status, sizeof(tdeck_ui_status), "Ready");
 }
 
 void tdeck_ui_loop() {
     if (!tdeck_ui_ready) return;
 
-    // Poll keyboard (the BBQ10 latches key events until read)
+    // Poll keyboard (the BBQ10/C3 latch key events until read)
     TDeckKeyboard::KeyEvent key_event = tdeck_kb.keyEvent();
     if (key_event.key != '\0' || key_event.state != KB_KEY_STATE_IDLE) {
         tdeck_ui_handle_key(key_event.key, key_event.state);
         tdeck_kb.clearInterruptStatus();
+        tdeck_ui_dirty = true;
     }
 
     // Poll trackball
     tb_event_t tb_events = tdeck_trackball.readEvents();
     if (tb_events != TB_EVENT_NONE) {
         tdeck_ui_handle_trackball(tb_events);
+        tdeck_ui_dirty = true;
     }
 
-    // Step the test sequence / refresh the UI at the configured rate
-    if (millis() - tdeck_ui_last_tick >= tdeck_ui_tick_ms) {
+    // The boot-time RGB sequence drives the panel directly on its own timer.
+    #ifdef TDECKUITEST
+    if (tdeck_ui_state == TDECK_UI_STATE_TEST) {
+        tdeck_ui_run_test();
+        return;
+    }
+    #endif
+
+    // Repaint on input events, or periodically on the status screen so the
+    // radio/battery state stays fresh. Full-frame pushes mean no flicker.
+    bool periodic = (millis() - tdeck_ui_last_tick >= tdeck_ui_tick_ms);
+    if (periodic) {
         tdeck_ui_last_tick = millis();
+    }
+    if (tdeck_ui_dirty || (periodic && tdeck_ui_state == TDECK_UI_STATE_STATUS)) {
+        tdeck_ui_dirty = false;
         tdeck_ui_draw();
     }
 }

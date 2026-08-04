@@ -492,11 +492,14 @@ bool display_init() {
           disp_mode = DISP_MODE_LANDSCAPE;
           display.setRotation(0);
         #elif BOARD_MODEL == BOARD_TDECK
-          // The LilyGO T-Deck's ST7789 panel is natively 240x320 portrait.
-          // Rotation 0 presents the display in its native portrait
-          // orientation, which matches the T-Deck UI's drawing surface.
-          disp_mode = DISP_MODE_PORTRAIT;
-          display.setRotation(0);
+          // The LilyGO T-Deck's ST7789 panel is physically mounted in
+          // landscape (320x240). The controller's native orientation is
+          // portrait 240x320, so rotation 0 renders the image 90 degrees
+          // clockwise. Rotation 3 rotates the content 90 degrees counter-
+          // clockwise into the physical landscape orientation, giving the
+          // T-Deck UI a 320x240 drawing surface.
+          disp_mode = DISP_MODE_LANDSCAPE;
+          display.setRotation(3);
         #elif BOARD_MODEL == BOARD_TECHO
           disp_mode = DISP_MODE_PORTRAIT;
           display.setRotation(3);

@@ -8,7 +8,9 @@
 // Trackball driver for the LilyGO T-Deck. The trackball reports directional
 // movement through four GPIO lines (UP/DOWN/LEFT/RIGHT) and a centre press.
 // Each axis line produces a falling-edge pulse when the ball is rolled, and
-// the centre button is an active-low switch. This driver implements the same
+// the centre button is an active-low switch. The centre button is edge-tracked
+// on CHANGE so the release edge can latch the press event (a FALLING-only
+// interrupt would never complete a tap). This driver implements the same
 // GPIO-interrupt polling pattern used by Meshtastic's TrackballInterruptBase.
 //
 // The singleton instance and the static ISR pointer are defined exactly once
@@ -54,7 +56,8 @@ typedef enum {
 
 class TDeckTrackball {
   public:
-    TDeckTrackball() : _latched(TB_EVENT_NONE), _last_clear(0), _press_started(0) {}
+    TDeckTrackball() : _latched(TB_EVENT_NONE), _last_clear(0), _press_started(0),
+                       _press_level(true), _last_press_edge(0) {}
 
     void begin() {
         // Rebind the ISR trampolines to this instance
@@ -70,7 +73,11 @@ class TDeckTrackball {
         attachInterrupt(digitalPinToInterrupt(TB_DOWN), s_isr_down, TB_DIRECTION);
         attachInterrupt(digitalPinToInterrupt(TB_LEFT), s_isr_left, TB_DIRECTION);
         attachInterrupt(digitalPinToInterrupt(TB_RIGHT), s_isr_right, TB_DIRECTION);
-        attachInterrupt(digitalPinToInterrupt(TB_PRESS), s_isr_press, TB_DIRECTION);
+        // The centre button is an active-low switch whose press event is
+        // latched on the RELEASE (rising) edge, so it must be edge-tracked
+        // on CHANGE. A FALLING-only interrupt would record the press start
+        // but never complete a tap. The direction lines stay on FALLING.
+        attachInterrupt(digitalPinToInterrupt(TB_PRESS), s_isr_press, CHANGE);
 
         _last_clear = millis();
     }
@@ -113,10 +120,30 @@ class TDeckTrackball {
         _press_started = 0;
     }
 
+    // Debounced centre-button handler, invoked on both press and release
+    // edges. Contact bounce on either edge is filtered by tracking the last
+    // accepted level and requiring a short quiet window between edges.
+    void handlePressISR() {
+        bool down = (digitalRead(TB_PRESS) == LOW);
+        if (down == _press_level) return;          // bounce of the same level
+        uint32_t now = millis();
+        if ((now - _last_press_edge) < 25) return; // contact-bounce filter
+        _press_level = down;
+        _last_press_edge = now;
+        if (down) {
+            latchPressStart();
+        } else {
+            latchPressEnd();
+            latch(TB_EVENT_PRESS);
+        }
+    }
+
   private:
     volatile tb_event_t _latched;
     volatile uint32_t _last_clear;
     volatile uint32_t _press_started;
+    volatile bool     _press_level;
+    volatile uint32_t _last_press_edge;
 
     static TDeckTrackball *s_instance;
 
@@ -132,12 +159,7 @@ class TDeckTrackball {
     static void s_isr_right() { if (s_instance) s_instance->latch(TB_EVENT_RIGHT); }
     static void s_isr_press() {
         if (!s_instance) return;
-        if (digitalRead(TB_PRESS) == LOW) {
-            s_instance->latchPressStart();
-        } else {
-            s_instance->latchPressEnd();
-            s_instance->latch(TB_EVENT_PRESS);
-        }
+        s_instance->handlePressISR();
     }
 };
 
