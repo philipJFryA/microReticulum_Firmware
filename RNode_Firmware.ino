@@ -786,8 +786,7 @@ void setup() {
     update_display();
 
     // The T-Deck UI owns the ST7789 screen, BBQ10 keyboard and trackball.
-    // Initialisation is unconditional (not guarded by TDECKUITEST) — only
-    // the boot-time RGB + input test sequence itself is compile-time gated.
+    // Initialisation is unconditional.
     #if BOARD_MODEL == BOARD_TDECK
       tdeck_ui_init();
     #endif
@@ -2787,8 +2786,7 @@ void loop() {
     input_read();
   #endif
 
-  // Service the T-Deck UI (keyboard + trackball events, screen refresh,
-  // and the TDECKUITEST-guarded RGB/input test sequence).
+  // Service the T-Deck UI (keyboard + trackball events and screen refresh).
   #if BOARD_MODEL == BOARD_TDECK
     tdeck_ui_loop();
   #endif
