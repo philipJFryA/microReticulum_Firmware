@@ -74,11 +74,17 @@
 #define TDECK_UI_RNS_APP         "tdeck_ui"
 #define TDECK_UI_RNS_ASPECT_MSGS "messages"
 #define TDECK_UI_RNS_ASPECT_PING "ping"
+#define TDECK_UI_RNS_ASPECT_BCAST "broadcast"
 
 // Simple line-based payload framing (robust against arbitrary message text).
 #define TDECK_FRAME_MSG  "!mrmsg!"    // !mrmsg!<sender_hash>!<text>
 #define TDECK_FRAME_PING "!mrping!"   // !mrping!<seq>!<sent_at>!<sender_pubkey>
 #define TDECK_FRAME_PONG "!mrpong!"   // !mrpong!<seq>!<sent_at>
+#define TDECK_FRAME_BCAST "!mrbcast!" // !mrbcast!<sender_hash>!<text>
+
+// Broadcast conversation sentinel peer (not a contact hash: "bcast" is not
+// a 32-char hex string, so it can never collide with a real identity hash).
+#define TDECK_BCAST_PEER "bcast"
 
 // ---- Storage / data limits ---------------------------------------------------
 #define TDECK_SETTINGS_PATH "/settings.yaml"
@@ -190,6 +196,12 @@ static uint16_t tdeck_set_announce_interval  = 0;    // minutes; 0 = off
 static bool     tdeck_set_confirm_send       = false;
 static bool     tdeck_settings_dirty         = false;
 
+// Valid SX126x signal bandwidth options (Hz), used by the radio BW editor.
+static const uint32_t tdeck_bw_options[] = {
+    7800, 10400, 15600, 20800, 31250, 41700, 62500, 125000, 250000, 500000
+};
+#define TDECK_BW_OPTIONS (sizeof(tdeck_bw_options) / sizeof(tdeck_bw_options[0]))
+
 // ---- Runtime state -----------------------------------------------------------
 static bool     tdeck_ui_ready       = false;
 static bool     tdeck_dirty          = true;
@@ -245,6 +257,7 @@ static uint8_t  tdeck_set_edit_idx = 0;   // row being edited in SET_EDIT
 #ifdef HAS_RNS
 static RNS::Destination tdeck_rns_msg_dest({RNS::Type::NONE});
 static RNS::Destination tdeck_rns_ping_dest({RNS::Type::NONE});
+static RNS::Destination tdeck_rns_bcast_dest({RNS::Type::NONE});
 static RNS::HAnnounceHandler tdeck_rns_ann_handler;
 static bool tdeck_rns_ready = false;
 static double tdeck_last_announce_at = 0.0;
@@ -294,6 +307,7 @@ static void     tdeck_rns_sync_contacts();
 static void     tdeck_rns_announce_ui();
 static bool     tdeck_rns_send_payload(const tdeck_contact_t* c, const char* aspect,
                                        const char* payload);
+static bool     tdeck_rns_send_broadcast(const char* text);
 static void     tdeck_rns_ping_contact(uint8_t idx);
 static void     tdeck_rns_ping_poll();
 static void     tdeck_rns_trace_contact(uint8_t idx);
@@ -462,28 +476,39 @@ static void tdeck_input_del() {
 // Commit the text entry buffer according to the context it was started in.
 static void tdeck_input_apply() {
     if (tdeck_input_ctx == 0) {
-        // Compose: send the message to tdeck_input_peer's contact.
+        // Compose: broadcast to all nodes, or send to tdeck_input_peer.
         if (tdeck_input_len == 0) {
             tdeck_ui_nav_back();
             return;
         }
-        tdeck_contact_t* c = tdeck_contact_find(tdeck_input_peer);
+        bool is_bcast = (strcmp(tdeck_input_peer, TDECK_BCAST_PEER) == 0);
+        tdeck_contact_t* c = is_bcast ? NULL : tdeck_contact_find(tdeck_input_peer);
       #ifdef HAS_RNS
-        if (!c || !c->has_key) {
+        if (is_bcast) {
+            if (tdeck_rns_send_broadcast(tdeck_input_buf)) {
+                tdeck_msg_add(TDECK_BCAST_PEER, tdeck_input_buf, false);
+                tdeck_toast_set("Broadcast sent");
+            } else {
+                tdeck_toast_set("Send failed");
+                return;
+            }
+        } else if (!c || !c->has_key) {
             tdeck_toast_set("No key for contact");
             return;
-        }
-        char frame[TDECK_MSG_MAX_LEN + 64];
-        snprintf(frame, sizeof(frame), "%s%s!%s", TDECK_FRAME_MSG, c->hash, tdeck_input_buf);
-        if (tdeck_rns_send_payload(c, TDECK_UI_RNS_ASPECT_MSGS, frame)) {
-            tdeck_msg_add(c->hash, tdeck_input_buf, false);
-            tdeck_toast_set("Message sent");
         } else {
-            tdeck_toast_set("Send failed");
-            return;
+            char frame[TDECK_MSG_MAX_LEN + 64];
+            snprintf(frame, sizeof(frame), "%s%s!%s", TDECK_FRAME_MSG, c->hash, tdeck_input_buf);
+            if (tdeck_rns_send_payload(c, TDECK_UI_RNS_ASPECT_MSGS, frame)) {
+                tdeck_msg_add(c->hash, tdeck_input_buf, false);
+                tdeck_toast_set("Message sent");
+            } else {
+                tdeck_toast_set("Send failed");
+                return;
+            }
         }
       #else
         (void)c;
+        (void)is_bcast;
         tdeck_toast_set("RNS unavailable");
         return;
       #endif
@@ -609,6 +634,16 @@ static bool tdeck_settings_load() {
                 tdeck_set_announce_interval = (uint16_t)constrain(atoi(vs), 0, 1440);
             } else if (k == "confirm_send") {
                 tdeck_set_confirm_send = (v == "true");
+            } else if (k == "radio_freq") {
+                lora_freq = (uint32_t)constrain(atol(vs), 100000000L, 1000000000L);
+            } else if (k == "radio_bw") {
+                lora_bw = (uint32_t)constrain(atol(vs), 7800L, 500000L);
+            } else if (k == "radio_sf") {
+                lora_sf = constrain(atoi(vs), 5, 12);
+            } else if (k == "radio_cr") {
+                lora_cr = constrain(atoi(vs), 5, 8);
+            } else if (k == "radio_txp") {
+                lora_txp = constrain(atoi(vs), -9, 22);
             }
         } else {
             // Contacts section: "- hash:" starts an entry, indented keys follow.
@@ -661,6 +696,11 @@ static bool tdeck_settings_save() {
     f.printf("gps_enabled: %s\n", tdeck_set_gps_enabled ? "true" : "false");
     f.printf("announce_interval: %u\n", tdeck_set_announce_interval);
     f.printf("confirm_send: %s\n", tdeck_set_confirm_send ? "true" : "false");
+    f.printf("radio_freq: %u\n", lora_freq);
+    f.printf("radio_bw: %u\n", lora_bw);
+    f.printf("radio_sf: %d\n", lora_sf);
+    f.printf("radio_cr: %d\n", lora_cr);
+    f.printf("radio_txp: %d\n", lora_txp);
     f.println("contacts:");
     for (uint8_t i = 0; i < tdeck_contact_count; i++) {
         tdeck_contact_t& c = tdeck_contacts[i];
@@ -777,6 +817,34 @@ static void tdeck_rns_on_message(const RNS::Bytes& data, const RNS::Packet& pack
     tdeck_dirty = true;
 }
 
+// Packet callback for the local "tdeck_ui.broadcast" PLAIN destination.
+// Broadcasts are unencrypted; the sender announces itself via the
+// "!mrbcast!" frame's sender hash field. Messages land in a single shared
+// "Broadcast" conversation (TDECK_BCAST_PEER) so the inbox stays clean.
+static void tdeck_rns_on_broadcast(const RNS::Bytes& data, const RNS::Packet& packet) {
+    (void)packet;
+    std::string s = data.toString();
+    if (s.rfind(TDECK_FRAME_BCAST, 0) != 0) return;
+    const char* p = s.c_str() + strlen(TDECK_FRAME_BCAST);
+
+    char sender[40];
+    p = tdeck_rns_field(p, 0, sender, sizeof(sender));
+    if (!p || !sender[0]) return;
+
+    // Don't echo our own broadcasts back into the thread (the outbound copy
+    // is already added locally by tdeck_input_apply).
+    const RNS::Identity& id = RNS::Transport::identity();
+    if (id && strcmp(sender, id.hash().toHex().c_str()) == 0) return;
+
+    char text[TDECK_MSG_MAX_LEN+1];
+    strncpy(text, p, sizeof(text)-1);
+    text[sizeof(text)-1] = '\0';
+
+    tdeck_contact_upsert(sender, NULL, NULL, NULL, 0);
+    tdeck_msg_add(TDECK_BCAST_PEER, text, true);
+    tdeck_dirty = true;
+}
+
 // Packet callback for the local "tdeck_ui.ping" IN destination: answers ping
 // requests and collects pong replies for the in-flight ping.
 static void tdeck_rns_on_ping(const RNS::Bytes& data, const RNS::Packet& packet) {
@@ -855,6 +923,22 @@ static void tdeck_rns_setup() {
     tdeck_rns_ping_dest.set_packet_callback(tdeck_rns_on_ping);
     tdeck_rns_ping_dest.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
 
+    // Shared PLAIN broadcast destination: any node running this UI can
+    // transmit unencrypted broadcasts to every other UI node in range
+    // without needing their public key first. PLAIN destinations cannot
+    // hold an identity (Destination.cpp throws std::invalid_argument),
+    // so register with a null identity — the destination hash is then
+    // derived from the app+aspect name alone, giving every UI node the
+    // same unencrypted channel. PLAIN destinations also cannot be
+    // announced (Destination::announce throws), so listeners discover
+    // the channel implicitly by registering the same name.
+    tdeck_rns_bcast_dest = RNS::Destination(RNS::Identity({RNS::Type::NONE}),
+                                            RNS::Type::Destination::IN,
+                                            RNS::Type::Destination::PLAIN,
+                                            TDECK_UI_RNS_APP, TDECK_UI_RNS_ASPECT_BCAST);
+    tdeck_rns_bcast_dest.set_packet_callback(tdeck_rns_on_broadcast);
+    tdeck_rns_bcast_dest.set_proof_strategy(RNS::Type::Destination::PROVE_NONE);
+
     tdeck_rns_ann_handler = RNS::HAnnounceHandler(new TDeckAnnounceHandler());
     RNS::Transport::register_announce_handler(tdeck_rns_ann_handler);
 
@@ -864,7 +948,27 @@ static void tdeck_rns_setup() {
     tdeck_dirty = true;
 }
 
+// Send an unencrypted broadcast to the shared "tdeck_ui.broadcast" PLAIN
+// destination. The sender's identity hash is embedded in the frame so
+// receiving UIs can upsert the caller into their contact store.
+static bool tdeck_rns_send_broadcast(const char* text) {
+    if (!tdeck_rns_ready || !tdeck_rns_bcast_dest) return false;
+    const RNS::Identity& id = RNS::Transport::identity();
+    if (!id) return false;
+
+    char frame[TDECK_MSG_MAX_LEN + 64];
+    snprintf(frame, sizeof(frame), "%s%s!%s", TDECK_FRAME_BCAST,
+             id.hash().toHex().c_str(), text);
+    RNS::Destination out({RNS::Type::NONE}, RNS::Type::Destination::OUT,
+                         RNS::Type::Destination::PLAIN,
+                         TDECK_UI_RNS_APP, TDECK_UI_RNS_ASPECT_BCAST);
+    RNS::Packet(out, RNS::Bytes(frame)).send();
+    return true;
+}
+
 // Re-announce the UI destinations (used at startup and when the name changes).
+// PLAIN broadcast destinations cannot be announced, so only the SINGLE
+// destinations are re-announced here.
 static void tdeck_rns_announce_ui() {
     if (!tdeck_rns_ready) return;
     RNS::Bytes name(tdeck_set_device_name);
@@ -1211,10 +1315,14 @@ static void tdeck_ui_draw_messages() {
             } else {
                 char peer[40];
                 if (tdeck_inbox_peer_at(idx - 1, peer, sizeof(peer))) {
-                    tdeck_contact_t* cnt = tdeck_contact_find(peer);
-                    char label[40];
-                    tdeck_contact_label(cnt, label, sizeof(label));
-                    snprintf(line, sizeof(line), "%s%s", (cnt && cnt->favorite) ? "* " : "", label);
+                    if (strcmp(peer, TDECK_BCAST_PEER) == 0) {
+                        snprintf(line, sizeof(line), "* Broadcast");
+                    } else {
+                        tdeck_contact_t* cnt = tdeck_contact_find(peer);
+                        char label[40];
+                        tdeck_contact_label(cnt, label, sizeof(label));
+                        snprintf(line, sizeof(line), "%s%s", (cnt && cnt->favorite) ? "* " : "", label);
+                    }
                 } else {
                     snprintf(line, sizeof(line), "?");
                 }
@@ -1226,10 +1334,15 @@ static void tdeck_ui_draw_messages() {
         c.setTextSize(2);
         c.setTextColor(TDECK_COL_ACCENT);
         c.setCursor(TDECK_LIST_X, TDECK_SBAR_H + 4);
-        tdeck_contact_t* cnt = tdeck_contact_find(tdeck_thread_peer);
-        char label[48];
-        tdeck_contact_label(cnt, label, sizeof(label));
-        c.print(label);
+        const char* tlabel = (strcmp(tdeck_thread_peer, TDECK_BCAST_PEER) == 0)
+                             ? "Broadcast"
+                             : [&]() {
+                                 tdeck_contact_t* cnt = tdeck_contact_find(tdeck_thread_peer);
+                                 static char lbuf[48];
+                                 tdeck_contact_label(cnt, lbuf, sizeof(lbuf));
+                                 return lbuf;
+                             }();
+        c.print(tlabel);
         c.drawFastHLine(0, TDECK_SBAR_H + 24, TDECK_SCREEN_W, TDECK_COL_DIM);
 
         // Collect indices of the conversation's messages, newest at the bottom.
@@ -1262,19 +1375,23 @@ static void tdeck_ui_draw_messages() {
         }
         tdeck_ui_draw_footer(c, "press: reply  L: back");
     } else if (tdeck_sub == MSG_PICK) {
-        uint8_t total = tdeck_contact_count;
+        uint8_t total = tdeck_contact_count + 1;       // "+ Broadcast" first
         uint8_t rows = tdeck_ui_list_frame(c, "To", total, tdeck_cursor, &tdeck_scroll);
         for (uint8_t r = 0; r < rows && tdeck_scroll + r < total; r++) {
             uint8_t idx = tdeck_scroll + r;
-            char label[48];
-            tdeck_contact_label(&tdeck_contacts[idx], label, sizeof(label));
-            tdeck_ui_draw_row(c, TDECK_SBAR_H + 30 + r * 16, label, idx == tdeck_cursor);
+            char line[48];
+            if (idx == 0) {
+                snprintf(line, sizeof(line), "+ Broadcast");
+            } else {
+                tdeck_contact_label(&tdeck_contacts[idx - 1], line, sizeof(line));
+            }
+            tdeck_ui_draw_row(c, TDECK_SBAR_H + 30 + r * 16, line, idx == tdeck_cursor);
         }
-        if (total == 0) {
+        if (total == 1) {
             c.setTextSize(1);
             c.setTextColor(TDECK_COL_WARN);
             c.setCursor(TDECK_LIST_X, TDECK_SBAR_H + 60);
-            c.print("No contacts yet - wait for announces");
+            c.print("No contacts yet - broadcast to all UI nodes");
         }
         tdeck_ui_draw_footer(c, "select contact  L: back");
     } else if (tdeck_sub == MSG_COMPOSE) {
@@ -1422,9 +1539,10 @@ static void tdeck_ui_draw_reticulum() {
     TDeckCanvas &c = tdeck_canvas;
     if (tdeck_sub == RET_MENU) {
         static const char* items[] = {
-            "Ping contact", "Traceroute contact", "Direct contacts", "My identity"
+            "Ping contact", "Traceroute contact", "Direct contacts",
+            "My identity", "Announce now"
         };
-        uint8_t n = 4;
+        uint8_t n = 5;
         uint8_t rows = tdeck_ui_list_frame(c, "Reticulum", n, tdeck_cursor, &tdeck_scroll);
         for (uint8_t r = 0; r < rows && tdeck_scroll + r < n; r++) {
             uint8_t idx = tdeck_scroll + r;
@@ -1570,7 +1688,7 @@ static void tdeck_ui_draw_reticulum_rest() {
 
 // Settings list: fills `label`/`value` for a given row; `action` marks rows
 // that execute immediately instead of being edited numerically.
-#define TDECK_SET_ROWS 9
+#define TDECK_SET_ROWS 14
 static void tdeck_set_row(uint8_t idx, char* label, size_t n, char* value, size_t vn, bool* action) {
     switch (idx) {
         case 0: snprintf(label, n, "Node name");   snprintf(value, vn, "%s", tdeck_set_device_name); *action = true; break;
@@ -1579,8 +1697,46 @@ static void tdeck_set_row(uint8_t idx, char* label, size_t n, char* value, size_
         case 3: snprintf(label, n, "Show GPS");    snprintf(value, vn, "%s", tdeck_set_gps_enabled ? "yes" : "no"); *action = false; break;
         case 4: snprintf(label, n, "Announce min"); snprintf(value, vn, "%u", tdeck_set_announce_interval); *action = false; break;
         case 5: snprintf(label, n, "Confirm send"); snprintf(value, vn, "%s", tdeck_set_confirm_send ? "yes" : "no"); *action = false; break;
-        case 6: snprintf(label, n, "Save to SD");  snprintf(value, vn, ""); *action = true; break;
-        case 7: snprintf(label, n, "Reload from SD"); snprintf(value, vn, ""); *action = true; break;
+        case 6: {   // Radio frequency (Hz)
+            snprintf(label, n, "Radio freq");
+            if (lora_freq > 0) snprintf(value, vn, "%u.%03u MHz", lora_freq / 1000000, (lora_freq / 1000) % 1000);
+            else snprintf(value, vn, "unset");
+            *action = false;
+            break;
+        }
+        case 7: {   // Radio bandwidth (Hz)
+            snprintf(label, n, "Radio BW");
+            if (lora_bw > 0) {
+                if (lora_bw % 1000 == 0) snprintf(value, vn, "%u kHz", lora_bw / 1000);
+                else snprintf(value, vn, "%.1f kHz", lora_bw / 1000.0f);
+            } else {
+                snprintf(value, vn, "unset");
+            }
+            *action = false;
+            break;
+        }
+        case 8: {   // Spreading factor
+            snprintf(label, n, "Radio SF");
+            if (lora_sf > 0) snprintf(value, vn, "%d", lora_sf);
+            else snprintf(value, vn, "unset");
+            *action = false;
+            break;
+        }
+        case 9: {   // Coding rate
+            snprintf(label, n, "Radio CR");
+            snprintf(value, vn, "4/%d", lora_cr);
+            *action = false;
+            break;
+        }
+        case 10: {  // TX power (dBm)
+            snprintf(label, n, "Radio TXP");
+            if (lora_txp != 0xFF) snprintf(value, vn, "%d dBm", lora_txp);
+            else snprintf(value, vn, "unset");
+            *action = false;
+            break;
+        }
+        case 11: snprintf(label, n, "Save to SD");  snprintf(value, vn, ""); *action = true; break;
+        case 12: snprintf(label, n, "Reload from SD"); snprintf(value, vn, ""); *action = true; break;
         default: snprintf(label, n, "Export contacts"); snprintf(value, vn, ""); *action = true; break;
     }
 }
@@ -1712,6 +1868,55 @@ static void tdeck_set_edit_change(int dir) {
             break;
         }
         case 5: tdeck_set_confirm_send = !tdeck_set_confirm_send; tdeck_settings_dirty = true; break;
+        case 6: {   // Radio frequency: +/- 100 kHz
+            long v = (lora_freq > 0) ? (long)lora_freq : 868000000L;
+            v += (long)dir * 100000L;
+            lora_freq = (uint32_t)constrain(v, 100000000L, 1000000000L);
+            if (radio_online) setFrequency();
+            tdeck_settings_dirty = true;
+            break;
+        }
+        case 7: {   // Radio bandwidth: cycle through valid SX126x options
+            uint8_t best = 0;
+            if (lora_bw > 0) {
+                for (uint8_t i = 0; i < TDECK_BW_OPTIONS; i++) {
+                    if (tdeck_bw_options[i] <= lora_bw) best = i;
+                }
+            }
+            if (dir > 0) {
+                if (best + 1 < TDECK_BW_OPTIONS) best++;
+            } else {
+                if (best > 0) best--;
+            }
+            lora_bw = tdeck_bw_options[best];
+            if (radio_online) setBandwidth();
+            tdeck_settings_dirty = true;
+            break;
+        }
+        case 8: {   // Spreading factor: 5-12
+            int v = (lora_sf > 0) ? lora_sf : 7;
+            v += dir;
+            lora_sf = constrain(v, 5, 12);
+            if (radio_online) setSpreadingFactor();
+            tdeck_settings_dirty = true;
+            break;
+        }
+        case 9: {   // Coding rate: 4/5 - 4/8
+            int v = (lora_cr > 0) ? lora_cr : 5;
+            v += dir;
+            lora_cr = constrain(v, 5, 8);
+            if (radio_online) setCodingRate();
+            tdeck_settings_dirty = true;
+            break;
+        }
+        case 10: {  // TX power: -9 to 22 dBm
+            int v = (lora_txp != 0xFF) ? lora_txp : 17;
+            v += dir;
+            lora_txp = constrain(v, -9, 22);
+            if (radio_online) setTXPower();
+            tdeck_settings_dirty = true;
+            break;
+        }
         default: break;
     }
     tdeck_dirty = true;
@@ -1749,8 +1954,13 @@ static void tdeck_ui_nav_select() {
             tdeck_input_start(0, "");
             tdeck_ui_nav_push(SCREEN_MESSAGES, MSG_COMPOSE);
         } else if (tdeck_sub == MSG_PICK) {
-            if (tdeck_cursor < tdeck_contact_count) {
-                strncpy(tdeck_input_peer, tdeck_contacts[tdeck_cursor].hash, sizeof(tdeck_input_peer)-1);
+            if (tdeck_cursor == 0) {
+                // Broadcast to all UI nodes via the shared PLAIN destination.
+                strncpy(tdeck_input_peer, TDECK_BCAST_PEER, sizeof(tdeck_input_peer)-1);
+                tdeck_input_start(0, "");
+                tdeck_ui_nav_push(SCREEN_MESSAGES, MSG_COMPOSE);
+            } else if (tdeck_cursor - 1 < tdeck_contact_count) {
+                strncpy(tdeck_input_peer, tdeck_contacts[tdeck_cursor - 1].hash, sizeof(tdeck_input_peer)-1);
                 tdeck_input_start(0, "");
                 tdeck_ui_nav_push(SCREEN_MESSAGES, MSG_COMPOSE);
             }
@@ -1826,6 +2036,18 @@ static void tdeck_ui_nav_select() {
                 case 1: tdeck_ui_nav_push(SCREEN_RETICULUM, RET_TRACE_PICK); break;
                 case 2: tdeck_ui_nav_push(SCREEN_RETICULUM, RET_DIRECT); break;
                 case 3: tdeck_ui_nav_push(SCREEN_RETICULUM, RET_IDENTITY); break;
+                case 4:
+                  #ifdef HAS_RNS
+                    if (tdeck_rns_ready) {
+                        tdeck_rns_announce_ui();
+                        tdeck_toast_set("Announced");
+                    } else {
+                        tdeck_toast_set("RNS not ready");
+                    }
+                  #else
+                    tdeck_toast_set("RNS unavailable");
+                  #endif
+                    break;
                 default: break;
             }
         } else if (tdeck_sub == RET_PING_PICK) {
@@ -1884,20 +2106,41 @@ static void tdeck_ui_nav_select() {
                     tdeck_input_start(2, tdeck_set_device_name);
                     tdeck_ui_nav_push(SCREEN_RETICULUM, RET_NAME_EDIT);
                     break;
-                case 1: case 2: case 3: case 4: case 5:
+                case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 10:
                     tdeck_set_edit_idx = tdeck_cursor;
                     tdeck_ui_nav_push(SCREEN_SETTINGS, SET_EDIT);
                     break;
-                case 6:
-                    if (tdeck_settings_save()) tdeck_toast_set("Saved to SD");
-                    else tdeck_toast_set("SD save failed");
+                case 11:
+                    if (tdeck_settings_save()) {
+                        // Radio parameters are also persisted into EEPROM so a
+                        // reboot applies them via the normal eeprom_conf_load()
+                        // + startRadio() path (mirrors the Provisioning
+                        // subsystem's FF_REBOOT_REQUIRED radio fields).
+                        if (hw_ready && radio_online) {
+                            eeprom_conf_save();
+                            tdeck_toast_set("Saved (SD+EEPROM)");
+                        } else {
+                            tdeck_toast_set("Saved to SD only");
+                        }
+                    } else {
+                        tdeck_toast_set("SD save failed");
+                    }
                     break;
-                case 7:
+                case 12:
                     tdeck_settings_load();
                     tdeck_apply_brightness();
+                    // Apply any radio parameters loaded from settings.yaml to
+                    // the live radio hardware.
+                    if (radio_online) {
+                        setBandwidth();
+                        setSpreadingFactor();
+                        setCodingRate();
+                        setTXPower();
+                        setFrequency();
+                    }
                     tdeck_toast_set("Reloaded");
                     break;
-                case 8:
+                case 13:
                     if (tdeck_contacts_export()) tdeck_toast_set("Exported");
                     else tdeck_toast_set("Export failed");
                     break;
@@ -1961,7 +2204,7 @@ static void tdeck_ui_nav_down() {
         } else if (tdeck_sub == MSG_THREAD) {
             if (tdeck_scroll > 0) tdeck_scroll--;   // view newer messages
         } else if (tdeck_sub == MSG_PICK) {
-            if (tdeck_cursor + 1 < tdeck_contact_count) tdeck_cursor++;
+            if (tdeck_cursor + 1 < tdeck_contact_count + 1) tdeck_cursor++;
         }
         break;
       case SCREEN_CONTACTS:
@@ -1973,7 +2216,7 @@ static void tdeck_ui_nav_down() {
         break;
       case SCREEN_RETICULUM:
         if (tdeck_sub == RET_MENU) {
-            if (tdeck_cursor + 1 < 4) tdeck_cursor++;
+            if (tdeck_cursor + 1 < 5) tdeck_cursor++;
         } else if (tdeck_sub == RET_PING_PICK || tdeck_sub == RET_TRACE_PICK) {
             if (tdeck_cursor + 1 < tdeck_contact_count) tdeck_cursor++;
         } else if (tdeck_sub == RET_DIRECT) {
