@@ -1139,9 +1139,6 @@ static uint8_t tdeck_ui_list_frame(TDeckCanvas& c, const char* title, uint8_t n,
 
 static void tdeck_ui_draw_home() {
     TDeckCanvas &c = tdeck_canvas;
-    c.fillScreen(TDECK_COL_BG);
-    tdeck_ui_draw_status_bar(c);
-
     c.setTextSize(2);
     c.setTextColor(TDECK_COL_ACCENT);
     c.setCursor(10, TDECK_SBAR_H + 8);
@@ -1202,9 +1199,6 @@ static bool tdeck_inbox_peer_at(uint8_t idx, char* out, size_t n) {
 
 static void tdeck_ui_draw_messages() {
     TDeckCanvas &c = tdeck_canvas;
-    c.fillScreen(TDECK_COL_BG);
-    tdeck_ui_draw_status_bar(c);
-
     if (tdeck_sub == MSG_INBOX) {
         uint8_t nconv = tdeck_inbox_peer_count();
         uint8_t total = nconv + 1;                       // "+ New message"
@@ -1291,9 +1285,6 @@ static void tdeck_ui_draw_messages() {
 // Full-screen text entry used by compose / alias / name editing.
 static void tdeck_ui_draw_text_input(const char* title, const char* buf) {
     TDeckCanvas &c = tdeck_canvas;
-    c.fillScreen(TDECK_COL_BG);
-    tdeck_ui_draw_status_bar(c);
-
     c.setTextSize(2);
     c.setTextColor(TDECK_COL_ACCENT);
     c.setCursor(TDECK_LIST_X, TDECK_SBAR_H + 8);
@@ -1327,9 +1318,6 @@ static void tdeck_ui_draw_text_input(const char* title, const char* buf) {
 
 static void tdeck_ui_draw_contacts() {
     TDeckCanvas &c = tdeck_canvas;
-    c.fillScreen(TDECK_COL_BG);
-    tdeck_ui_draw_status_bar(c);
-
     if (tdeck_sub == CT_LIST) {
         uint8_t total = tdeck_contact_count;
         uint8_t rows = tdeck_ui_list_frame(c, "Contacts", total, tdeck_cursor, &tdeck_scroll);
@@ -1432,9 +1420,6 @@ static bool tdeck_direct_at(uint8_t idx, char* out, size_t n, uint8_t* hops) {
 
 static void tdeck_ui_draw_reticulum() {
     TDeckCanvas &c = tdeck_canvas;
-    c.fillScreen(TDECK_COL_BG);
-    tdeck_ui_draw_status_bar(c);
-
     if (tdeck_sub == RET_MENU) {
         static const char* items[] = {
             "Ping contact", "Traceroute contact", "Direct contacts", "My identity"
@@ -1602,9 +1587,6 @@ static void tdeck_set_row(uint8_t idx, char* label, size_t n, char* value, size_
 
 static void tdeck_ui_draw_settings() {
     TDeckCanvas &c = tdeck_canvas;
-    c.fillScreen(TDECK_COL_BG);
-    tdeck_ui_draw_status_bar(c);
-
     if (tdeck_sub == SET_LIST) {
         uint8_t rows = tdeck_ui_list_frame(c, "Settings", TDECK_SET_ROWS, tdeck_cursor, &tdeck_scroll);
         for (uint8_t r = 0; r < rows && tdeck_scroll + r < TDECK_SET_ROWS; r++) {
@@ -1640,9 +1622,16 @@ static void tdeck_ui_draw_settings() {
     }
 }
 
-// Master draw: the status bar is drawn by every screen, then the active app.
+// Master draw: the canvas is cleared and the status bar is drawn exactly
+// once here, before the active app paints its content. Centralising the
+// frame preamble guarantees every screen (including tertiary sub-screens
+// like the Reticulum "Direct contacts" list) starts from a clean frame,
+// preventing stale pixels from a previous screen bleeding through.
 static void tdeck_ui_draw() {
     if (!tdeck_canvas.valid()) return;
+    TDeckCanvas &c = tdeck_canvas;
+    c.fillScreen(TDECK_COL_BG);
+    tdeck_ui_draw_status_bar(c);
     switch (tdeck_screen) {
         case SCREEN_HOME:      tdeck_ui_draw_home(); break;
         case SCREEN_MESSAGES:  tdeck_ui_draw_messages(); break;
