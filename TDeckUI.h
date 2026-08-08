@@ -2521,6 +2521,11 @@ void tdeck_ui_loop() {
             #if defined(LORA_TRANSPORT)
                 printf("[radio] model: 0x%02X", (unsigned int)model);
                 printf("[radio] TX power: %d dBm", LoRa->getTxPower());
+                // Full RF config so the two ends of a link can be compared
+                // byte-for-byte (freq/bw/sf/cr must match on both devices).
+                printf("[radio] freq: %lu Hz, bw: %lu Hz, sf: %d, cr: 4/%d",
+                       (unsigned long)lora_freq, (unsigned long)lora_bw,
+                       lora_sf, lora_cr);
             #endif
             // Any announces/broadcasts enqueued before the radio came up
             // (e.g. the NomadNet startup announce) need a CSMA pass to reach

@@ -1230,7 +1230,9 @@ inline void kiss_write_packet() {
 
 #if defined(HAS_RNS) && defined(LORA_TRANSPORT)
   if (host_write_len > 0) {
-    printf("[radio] Received %d byte packet", host_write_len);
+    printf("[radio] Received %d byte packet [data=", host_write_len);
+    for (uint16_t j = 0; j < host_write_len && j < 16; j++) { printf("%02X", pbuf[j]); }
+    printf("]");
     // CBA send packet received over LoRa to RNS in addition to connected client
     RNS::Bytes data(pbuf, host_write_len);
     lora_interface.r_stat_rssi(last_rssi);
@@ -1738,7 +1740,9 @@ void transmit(uint16_t size) {
       }
 
       add_airtime(written);
-      printf("[radio] Sent %d byte packet", written);
+      printf("[radio] Sent %d byte packet [hdr=%02X data=", written, header);
+      for (uint8_t j = 0; j < written-1 && j < 16; j++) { printf("%02X", tbuf[j]); }
+      printf("]");
 
     } else {
       led_tx_on(); uint16_t written = 0;
