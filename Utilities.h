@@ -1486,6 +1486,19 @@ void setTXPower() {
 
 		if (model == MODEL_FE) LoRa->setTxPower(mapped_lora_txp, PA_OUTPUT_PA_BOOST_PIN);
 		if (model == MODEL_FF) LoRa->setTxPower(mapped_lora_txp, PA_OUTPUT_RFO_PIN);
+
+		// CBA: The T-Deck is normally identified at runtime by MODEL_D4/MODEL_D9,
+		// seeded by tdeck_eeprovision_provision() before validate_status() reads
+		// it back via eeprom_model_valid(). In the edge case where that EEPROM
+		// identity seeding did not run (so `model` stayed 0x00) none of the
+		// MODEL_xx branches above would match and the radio would be left at
+		// begin()'s power default. Scope a fallback to the T-Deck at compile
+		// time so it can never misconfigure other unprovisioned boards.
+		#if BOARD_MODEL == BOARD_TDECK
+			if (model == 0x00) {
+				LoRa->setTxPower(mapped_lora_txp, PA_OUTPUT_PA_BOOST_PIN);
+			}
+		#endif
 	}
 }
 

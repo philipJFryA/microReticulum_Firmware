@@ -2503,8 +2503,11 @@ void tdeck_ui_loop() {
             tdeck_ui_debug("[TDeck] Radio CR default 4/5");
         }
         if (lora_txp == 0xFF) {
-            lora_txp = 7;
-            tdeck_ui_debug("[TDeck] Radio TXP default 7 dBm");
+            // 14 dBm sits at the bottom of the SX1262 high-power PA range
+            // (14-22 dBm) so a fresh device radiates a usable signal out of
+            // the box while staying near typical 868 MHz duty-cycle limits.
+            lora_txp = 14;
+            tdeck_ui_debug("[TDeck] Radio TXP default 14 dBm");
         }
 
         update_radio_lock();
@@ -2512,6 +2515,13 @@ void tdeck_ui_loop() {
             op_mode = MODE_TNC;
             RNS::Reticulum::transport_enabled(true);
             tdeck_ui_debug("[TDeck] Radio started from settings");
+            // Diagnostics: log the runtime device model and the effective TX
+            // power so a silent PA misconfiguration or a failed EEPROM
+            // identity seed (model==0x00) is immediately visible on serial.
+            #if defined(LORA_TRANSPORT)
+                printf("[radio] model: 0x%02X", (unsigned int)model);
+                printf("[radio] TX power: %d dBm", LoRa->getTxPower());
+            #endif
             // Any announces/broadcasts enqueued before the radio came up
             // (e.g. the NomadNet startup announce) need a CSMA pass to reach
             // the SX1262 - the main loop only calls tx_queue_handler() inside

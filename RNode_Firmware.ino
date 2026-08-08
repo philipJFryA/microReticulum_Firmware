@@ -1704,11 +1704,15 @@ void transmit(uint16_t size) {
             kiss_indicate_error(ERROR_MODEM_TIMEOUT);
             kiss_indicate_error(ERROR_TXFAILED);
             led_indicate_error(5);
+            // CBA: do not hard-reset on a TX failure. On embedded targets
+            // hard_reset() restarts the MCU, silently masking the fault while
+            // RX keeps "working" between reboots. Re-arm RX so the error is
+            // visible on the serial console and the device stays responsive.
             #if MCU_VARIANT == MCU_NATIVE
               if (native_config::g_config.reboot_on_tx_failure) { hard_reset(); }
               else { LoRa->receive(); return; }
             #else
-              hard_reset();
+              LoRa->receive(); return;
             #endif
           }
 
@@ -1724,11 +1728,12 @@ void transmit(uint16_t size) {
         kiss_indicate_error(ERROR_MODEM_TIMEOUT);
         kiss_indicate_error(ERROR_TXFAILED);
         led_indicate_error(5);
+        // CBA: do not hard-reset on a TX failure (see split-packet path above).
         #if MCU_VARIANT == MCU_NATIVE
           if (native_config::g_config.reboot_on_tx_failure) { hard_reset(); }
           else { LoRa->receive(); return; }
         #else
-          hard_reset();
+          LoRa->receive(); return;
         #endif
       }
 

@@ -865,21 +865,27 @@ void sx126x::setDio2AsRfSwitch(bool enable) {
 void sx126x::disableTCXO() { }
 
 void sx126x::setTxPower(int level, int outputPin) {
-  // Currently no low power mode for SX1262 implemented, assuming PA boost
-  
   // WORKAROUND - Better Resistance of the SX1262 Tx to Antenna Mismatch, see DS_SX1261-2_V1.2 datasheet chapter 15.2
   // RegTxClampConfig = @address 0x08D8
   writeRegister(0x08D8, readRegister(0x08D8) | (0x0F << 1));
 
-  uint8_t pa_buf[4];
-  pa_buf[0] = 0x04; // PADutyCycle needs to be 0x04 to achieve 22dBm output, but can be lowered for better efficiency at lower outputs
-  pa_buf[1] = 0x07; // HPMax at 0x07 is maximum supported for SX1262
-  pa_buf[2] = 0x00; // DeviceSel 0x00 for SX1262 (0x01 for SX1261)
-  pa_buf[3] = 0x01; // PALut always 0x01 (reserved according to datasheet)
-  executeOpcode(OP_PA_CONFIG_6X, pa_buf, 4); // set pa_config for high power
-
   if (level > 22) { level = 22; }
   else if (level < -9) { level = -9; }
+
+  // The SX1262 PA has two configurations:
+  //   - high-power PA: +14..+22 dBm (PADutyCycle 0x04, HPMax 0x07)
+  //   - low-power PA:  -9..+13 dBm  (PADutyCycle 0x04, HPMax 0x00)
+  // Programming the high-power config together with a SetTxParams value below
+  // 14 dBm yields negligible/unreliable RF output (TX_DONE still fires, so
+  // the failure is silent). Select the PA config from the requested level so
+  // the whole -9..22 dBm range actually radiates.
+  uint8_t pa_buf[4];
+  pa_buf[0] = 0x04; // PADutyCycle needs to be 0x04 to achieve 22dBm output, but can be lowered for better efficiency at lower outputs
+  pa_buf[1] = (level >= 14) ? 0x07 : 0x00; // HPMax 0x07 for high-power PA, 0x00 for low-power PA
+  pa_buf[2] = 0x00; // DeviceSel 0x00 for SX1262 (0x01 for SX1261)
+  pa_buf[3] = 0x01; // PALut always 0x01 (reserved according to datasheet)
+  executeOpcode(OP_PA_CONFIG_6X, pa_buf, 4);
+
   writeRegister(REG_OCP_6X, OCP_TUNED); // Use board-specific tuned OCP
 
   uint8_t tx_buf[2];
