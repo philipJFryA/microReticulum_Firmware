@@ -142,6 +142,22 @@ class TDeckCanvas : public Adafruit_GFX {
 static TDeckCanvas tdeck_canvas(TDECK_SCREEN_W, TDECK_SCREEN_H);
 static TDeckKeyboard tdeck_kb;
 
+// Defined in RNode_Firmware.ino after this header is included; forward
+// declared here so tdeck_ui_debug() can consult it.
+extern bool kiss_framed_logs;
+
+// Route diagnostic text through the same output path as firmware logs so it
+// never interleaves as unframed bytes into a KISS-aware host stream when
+// kiss_framed_logs is enabled (it defaults to false on embedded builds).
+static void tdeck_ui_debug(const char* msg) {
+  if (kiss_framed_logs) {
+    kiss_indicate_log(msg, strlen(msg));
+  } else {
+    Serial.println(msg);
+  }
+  Serial.flush();
+}
+
 // ---- Colours ----------------------------------------------------------------
 #define TDECK_COL_BG     ST77XX_BLACK
 #define TDECK_COL_FG     ST77XX_WHITE
@@ -159,6 +175,15 @@ static TDeckKeyboard tdeck_kb;
 // unit, so it is declared extern here.
 #ifdef HAS_RNS
 extern RNS::Reticulum reticulum;
+// Forward declarations for the radio bootstrap in tdeck_ui_loop().
+// startRadio(), update_radio_lock() and tx_queue_handler() are defined in
+// RNode_Firmware.ino after this header is included, so they must be
+// declared here.
+bool startRadio();
+void update_radio_lock();
+void tx_queue_handler();
+// packet queue depth (defined in RNode_Firmware.ino after this header).
+extern volatile uint8_t queue_height;
 #endif
 
 // ---- Contact store -----------------------------------------------------------
@@ -553,10 +578,10 @@ static bool tdeck_sd_init() {
     digitalWrite(SD_CS, HIGH);
     if (SD.begin(SD_CS, SPI, 4000000)) {
         tdeck_sd_ready = true;
-        Serial.println("[TDeck] SD card ready");
+        tdeck_ui_debug("[TDeck] SD card ready");
         return true;
     }
-    Serial.println("[TDeck] SD card not found (settings will not persist)");
+    tdeck_ui_debug("[TDeck] SD card not found (settings will not persist)");
   #endif
     return false;
 }
@@ -584,14 +609,17 @@ static void tdeck_settings_apply_contact(const char* hash, const char* alias,
 }
 
 // Strip surrounding quotes from a YAML scalar value (in place at *start).
+// Loops so already-corrupted values with multiple accumulated quote pairs
+// (""""MyNode"""") are fully unwrapped rather than one pair per load.
 static void tdeck_yaml_strip_quotes(const char** start) {
     const char* s = *start;
     while (*s == ' ' || *s == '\t') s++;
     size_t len = strlen(s);
-    if (len >= 2 && ((s[0] == '"' && s[len-1] == '"') || (s[0] == '\'' && s[len-1] == '\''))) {
+    while (len >= 2 && ((s[0] == '"' && s[len-1] == '"') || (s[0] == '\'' && s[len-1] == '\''))) {
         char* tmp = (char*)s;
         tmp[len-1] = '\0';
         s++;
+        len -= 2;
     }
     *start = s;
 }
@@ -623,7 +651,9 @@ static bool tdeck_settings_load() {
             v.trim();
             const char* vs = v.c_str();
             if (k == "device_name") {
+                tdeck_yaml_strip_quotes(&vs);
                 strncpy(tdeck_set_device_name, vs, sizeof(tdeck_set_device_name)-1);
+                tdeck_set_device_name[sizeof(tdeck_set_device_name)-1] = '\0';
             } else if (k == "brightness") {
                 tdeck_set_brightness = (uint8_t)constrain(atoi(vs), 0, 255);
             } else if (k == "blank_timeout") {
@@ -776,19 +806,33 @@ static const char* tdeck_rns_field(const char* start, uint8_t idx, char* out, si
 
 // Fired by the Transport for every announce heard on the mesh. Populates the
 // contact store with the announced identity (hash + public key + name).
+//
+// Sideband (and Reticulum generally) treats the announced *destination* hash
+// as the peer's addressable identity; the recalled Identity hash is the
+// cryptographic identity behind it. When Transport cannot recall the identity
+// for a destination (e.g. a non-T-Deck peer whose announce arrives before our
+// persisted identity store has been seeded, or a peer that announces a
+// destination not backed by a recallable identity), fall back to registering
+// the contact under the destination hash itself so announces always add a
+// contact regardless.
 static void tdeck_rns_on_announce(const RNS::Bytes& dst_hash, const RNS::Identity& id,
                                   const RNS::Bytes& app_data) {
     if (dst_hash.size() != RNS::Type::Reticulum::DESTINATION_LENGTH) return;
     char hash[40] = {0}, dest[40] = {0}, pub[140] = {0}, appd[TDECK_APP_DATA_MAX+1] = {0};
+
+    std::string dh = dst_hash.toHex();
+    strncpy(dest, dh.c_str(), sizeof(dest)-1);
 
     if (id) {
         std::string h = id.hash().toHex();
         strncpy(hash, h.c_str(), sizeof(hash)-1);
         std::string pk = id.get_public_key().toHex();
         strncpy(pub, pk.c_str(), sizeof(pub)-1);
+    } else {
+        // No recallable identity: register the contact under the announced
+        // destination hash (what Sideband shows as the peer address).
+        strncpy(hash, dest, sizeof(hash)-1);
     }
-    std::string dh = dst_hash.toHex();
-    strncpy(dest, dh.c_str(), sizeof(dest)-1);
     if (app_data.size() > 0) {
         std::string ad = app_data.toString();
         strncpy(appd, ad.c_str(), sizeof(appd)-1);
@@ -1646,6 +1690,33 @@ static void tdeck_ui_draw_reticulum_rest() {
             const RNS::Identity& id = RNS::Transport::identity();
             c.setTextColor(TDECK_COL_FG);
             c.setCursor(TDECK_LIST_X, y); c.print("Hash: "); c.print(id.hash().toHex().c_str()); y += 12;
+            c.setTextColor(TDECK_COL_ACCENT);
+            c.setCursor(TDECK_LIST_X, y); c.print("LXMF: "); c.print(RNS::Destination::hash(id, "lxmf", "delivery").toHex().c_str()); y += 12;
+            // The announced destination hashes are what remote peers (Sideband
+            // etc.) actually see for this node. The identity hash on its own
+            // cannot be derived back from a destination hash, so show the
+            // announced destinations to explain the addresses reported on the
+            // remote side of the mesh.
+            c.setTextColor(TDECK_COL_WARN);
+            c.setCursor(TDECK_LIST_X, y);
+            c.print("Announced:");
+            y += 12;
+            c.setTextColor(TDECK_COL_DIM);
+            c.setCursor(TDECK_LIST_X, y);
+            if (tdeck_rns_msg_dest) {
+                c.print("msgs "); c.print(tdeck_rns_msg_dest.hash().toHex().c_str());
+            } else {
+                c.print("msgs (pending)");
+            }
+            y += 12;
+            c.setCursor(TDECK_LIST_X, y);
+            if (tdeck_rns_ping_dest) {
+                c.print("ping "); c.print(tdeck_rns_ping_dest.hash().toHex().c_str());
+            } else {
+                c.print("ping (pending)");
+            }
+            y += 12;
+            c.setTextColor(TDECK_COL_FG);
             c.setCursor(TDECK_LIST_X, y); c.print("Name: "); c.print(tdeck_set_device_name); y += 12;
             c.setTextColor(TDECK_COL_DIM);
             c.setCursor(TDECK_LIST_X, y);
@@ -1722,9 +1793,9 @@ static void tdeck_set_row(uint8_t idx, char* label, size_t n, char* value, size_
             *action = false;
             break;
         }
-        case 9: {   // Coding rate
+        case 9: {   // Coding rate (LoRa 4/x, denominator x = 5-8)
             snprintf(label, n, "Radio CR");
-            snprintf(value, vn, "4/%d", lora_cr);
+            snprintf(value, vn, "%d", lora_cr);
             *action = false;
             break;
         }
@@ -2286,6 +2357,54 @@ static void tdeck_ui_handle_trackball(tb_event_t event) {
     tdeck_dirty = true;
 }
 
+// ---- EEPROM provisioning ------------------------------------------------------
+
+// A T-Deck provisioned purely through the UI (settings.yaml) never goes
+// through rnodeconf, so the EEPROM identity block (product/model/hwrev/serial/
+// made + lock + MD5 checksum) is left blank and validate_status() reports
+// "Device unprovisioned". Seed an rnodeconf-style identity here so the device
+// is provisioned exactly like every other board in the repo. Runs from
+// tdeck_ui_init() *before* validate_status() so the same boot already sees a
+// valid identity.
+static void tdeck_eeprom_provision() {
+    if (eeprom_lock_set()) return;                    // already provisioned
+
+    // Product / model / revision for the LilyGO T-Deck (Boards.h). MODEL_D9
+    // is the 868 MHz variant; use MODEL_D4 for the 433 MHz variant.
+    eeprom_write(ADDR_PRODUCT, PRODUCT_TDECK_V1);
+    eeprom_write(ADDR_MODEL,   MODEL_D9);
+    eeprom_write(ADDR_HW_REV,  0x01);
+
+    // Serial: first 4 bytes of the hardware UID (unique per device).
+    for (uint8_t i = 0; i < 4 && i < DEVICE_UID_LEN; i++) {
+        eeprom_write(ADDR_SERIAL + i, device_uid[i]);
+    }
+
+    // Manufacturing date: non-zero marker (not a real date).
+    uint32_t made = 0x4D525443;                       // "CTMR"
+    for (uint8_t i = 0; i < 4; i++) {
+        eeprom_write(ADDR_MADE + i, (uint8_t)(made >> (8 * (3 - i))));
+    }
+
+    // Lock the identity block last: eeprom_write() refuses further writes
+    // once the lock byte is set.
+    eeprom_update(eeprom_addr(ADDR_INFO_LOCK), INFO_LOCK_BYTE);
+
+    // Compute + store the MD5 over the 11-byte identity block so
+    // eeprom_checksum_valid() passes, exactly like rnodeconf produces.
+    uint8_t data[CHECKSUMMED_SIZE];
+    for (uint8_t i = 0; i < CHECKSUMMED_SIZE; i++) {
+        data[i] = EEPROM.read(eeprom_addr(i));
+    }
+    unsigned char *hash = MD5::make_hash((char *)data, CHECKSUMMED_SIZE);
+    for (uint8_t i = 0; i < 16; i++) {
+        eeprom_update(eeprom_addr(ADDR_CHKSUM + i), hash[i]);
+    }
+    free(hash);
+
+    tdeck_ui_debug("[TDeck] EEPROM provisioned (identity)");
+}
+
 // ---- Public API ---------------------------------------------------------------
 
 // Called by Display.h's update_display() to determine whether the T-Deck UI
@@ -2317,11 +2436,10 @@ void tdeck_ui_init() {
     // Start the keyboard. TDeckKeyboard auto-detects whether the unit has
     // the ESP32-C3 "T-Keyboard" byte-stream controller or a direct BBQ10.
     tdeck_kb.begin(&Wire);
-    Serial.print("[TDeck] keyboard: ");
     switch (tdeck_kb.protocol()) {
-        case 1: Serial.println("BBQ10 registers"); break;
-        case 2: Serial.println("ESP32-C3 byte-stream"); break;
-        default: Serial.println("not detected"); break;
+        case 1: tdeck_ui_debug("[TDeck] keyboard: BBQ10 registers"); break;
+        case 2: tdeck_ui_debug("[TDeck] keyboard: ESP32-C3 byte-stream"); break;
+        default: tdeck_ui_debug("[TDeck] keyboard: not detected"); break;
     }
 
     // Start the trackball GPIO interrupts
@@ -2330,7 +2448,7 @@ void tdeck_ui_init() {
     // Allocate the off-screen frame buffer (PSRAM-backed)
     tdeck_canvas.allocate();
     if (!tdeck_canvas.valid()) {
-        Serial.println("[TDeck] warning: could not allocate frame buffer");
+        tdeck_ui_debug("[TDeck] warning: could not allocate frame buffer");
     }
 
     // Mount the microSD card and load /settings.yaml (device settings plus
@@ -2338,6 +2456,10 @@ void tdeck_ui_init() {
     tdeck_sd_init();
     tdeck_settings_load();
     tdeck_apply_brightness();
+
+    // Seed the rnodeconf-style EEPROM identity so the device is provisioned
+    // like every other board in the repo (must run before validate_status()).
+    tdeck_eeprom_provision();
 
     tdeck_ui_ready = true;
     tdeck_dirty = true;
@@ -2349,6 +2471,55 @@ void tdeck_ui_loop() {
     if (!tdeck_ui_ready) return;
 
   #ifdef HAS_RNS
+    // The boot path only starts the radio when EEPROM holds a valid radio
+    // config AND device_init() succeeds. device_init() requires a firmware
+    // signature hash that only rnodeconf (with the private signing key) can
+    // write (VALIDATE_FIRMWARE), so on a UI-provisioned T-Deck hw_ready stays
+    // false even after tdeck_eeprom_provision(). The radio hardware itself is
+    // present (modem_installed), so bring it up here now that RNS is up, and
+    // re-enable transport since we are acting as a full node.
+    if (modem_installed && !radio_online && !console_active) {
+        // The standard hw_ready path is unreachable on this device (see
+        // above); mark the hardware ready so startRadio() and the EEPROM
+        // save path (eeprom_conf_save()) treat the device as provisioned.
+        if (!hw_ready) hw_ready = true;
+        // Apply sane defaults for any radio parameter that is unset or
+        // invalid so the radio can always start out of the box:
+        //   867.2 MHz, 125 kHz bandwidth, SF8, CR 4/5, +7 dBm
+        if (lora_freq == 0 || lora_freq < 100000000L || lora_freq > 1000000000L) {
+            lora_freq = 867200000;
+            tdeck_ui_debug("[TDeck] Radio freq default 867.2 MHz");
+        }
+        if (lora_bw == 0) {
+            lora_bw = 125000;
+            tdeck_ui_debug("[TDeck] Radio BW default 125 kHz");
+        }
+        if (lora_sf == 0) {
+            lora_sf = 8;
+            tdeck_ui_debug("[TDeck] Radio SF default 8");
+        }
+        if (lora_cr == 0) {
+            lora_cr = 5;
+            tdeck_ui_debug("[TDeck] Radio CR default 4/5");
+        }
+        if (lora_txp == 0xFF) {
+            lora_txp = 7;
+            tdeck_ui_debug("[TDeck] Radio TXP default 7 dBm");
+        }
+
+        update_radio_lock();
+        if (startRadio()) {
+            op_mode = MODE_TNC;
+            RNS::Reticulum::transport_enabled(true);
+            tdeck_ui_debug("[TDeck] Radio started from settings");
+            // Any announces/broadcasts enqueued before the radio came up
+            // (e.g. the NomadNet startup announce) need a CSMA pass to reach
+            // the SX1262 - the main loop only calls tx_queue_handler() inside
+            // `if (radio_online)`, so flush them right away.
+            if (queue_height > 0) tx_queue_handler();
+        }
+    }
+
     // Deferred RNS setup: the Reticulum instance starts later in setup(),
     // so the UI's destinations + announce handler are registered once it does.
     if (!tdeck_rns_ready && reticulum && RNS::Transport::identity()) {

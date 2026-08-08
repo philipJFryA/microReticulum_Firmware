@@ -98,7 +98,10 @@ volatile bool serial_buffering = false;
 #if PLATFORM == PLATFORM_NATIVE
 bool kiss_framed_logs = false;
 #else
-bool kiss_framed_logs = true;
+// Embedded builds default to raw (unframed) serial output so that logs are
+// human-readable in a plain serial terminal. Host tools that need KISS
+// framing can still toggle this at runtime via the provisioning interface.
+bool kiss_framed_logs = false;
 #endif
 bool nomadnet_enabled = true;
 RNS::Destination nomadnet_destination = {RNS::Type::NONE};
@@ -882,6 +885,22 @@ void setup() {
 
   // Validate board health, EEPROM and config
   validate_status();
+
+  // The T-Deck UI provisions the device through settings.yaml, so
+  // device_init() (which requires an rnodeconf firmware signature) never
+  // succeeds and validate_status() leaves op_mode as MODE_HOST. Setting
+  // op_mode to MODE_TNC here matters more than the LED/console labels:
+  // RNS::Transport::start() only initialises its file-backed stores (the
+  // known-identities store, path store, hashlist store) when transport is
+  // enabled. On a T-Deck booting with op_mode=MODE_HOST, setup() disables
+  // transport before reticulum.start(), so the known-identities store is
+  // never initialised and every remote announce drops its identity —
+  // the UI contact list can never grow and Identity::recall() returns a
+  // null identity for the announce handlers. The T-Deck is always a full
+  // node once the radio comes up, so force TNC here.
+  #if BOARD_MODEL == BOARD_TDECK
+    op_mode = MODE_TNC;
+  #endif
 
   #if defined(LORA_TRANSPORT)
   if (op_mode != MODE_TNC) LoRa->setFrequency(0);
