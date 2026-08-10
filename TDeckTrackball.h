@@ -127,7 +127,7 @@ class TDeckTrackball {
         bool down = (digitalRead(TB_PRESS) == LOW);
         if (down == _press_level) return;          // bounce of the same level
         uint32_t now = millis();
-        if ((now - _last_press_edge) < 25) return; // contact-bounce filter
+        if ((now - _last_press_edge) < 40) return; // contact-bounce filter
         _press_level = down;
         _last_press_edge = now;
         if (down) {
