@@ -598,8 +598,27 @@ static void tdeck_input_apply() {
                 tdeck_toast_set("Pack failed");
                 return;
             }
+            // LXMF messages are delivered to a SINGLE (opportunistic)
+            // destination. The Python reference implementation's
+            // LXMessage.__as_packet() sends self.packed[DESTINATION_LENGTH:]
+            // for opportunistic delivery — the destination hash is NOT
+            // included in the packet data, because the receiver's
+            // delivery_packet() handler prepends packet.destination.hash
+            // when reconstructing the full LXMF wire format. Our own
+            // receive path (tdeck_rns_on_message) models the same rule.
+            // Strip the 16-byte destination hash prefix so the remote
+            // LXMF client doesn't double-prepend it (which misaligns the
+            // msgpack payload and breaks unpacking with "object of type
+            // 'int' has no len()").
+            const size_t lxmf_dest_len = RNS::Type::Reticulum::DESTINATION_LENGTH;
+            RNS::Bytes lxmf_opportunistic;
+            if (lxmf_packed.size() >= lxmf_dest_len) {
+                lxmf_opportunistic = lxmf_packed.mid(lxmf_dest_len);
+            } else {
+                lxmf_opportunistic = lxmf_packed;
+            }
             if (tdeck_rns_send_payload(c, TDECK_UI_RNS_ASPECT_MSGS,
-                                       lxmf_packed)) {
+                                       lxmf_opportunistic)) {
                 tdeck_msg_add(c->hash, tdeck_input_buf, false);
                 tdeck_toast_set("Message sent");
             } else {
@@ -950,6 +969,14 @@ static void tdeck_rns_on_announce(const RNS::Bytes& dst_hash, const RNS::Identit
 // from the source hash. Unverifiable messages are accepted but flagged as
 // unverified (source identity unknown), mirroring the LXMF reference
 // implementation's SOURCE_UNKNOWN / SIGNATURE_INVALID handling.
+//
+// The same handler is registered both as the destination's packet callback
+// (for opportunistic single-packet delivery) and as the packet callback for
+// incoming links established to this destination (for link-delivered LXMF,
+// which is how Sideband / NomadNet / standard LXMF clients send messages
+// when a path and stable link are available). Link-delivered payloads have
+// the same wire layout minus the destination hash prefix (the link already
+// addresses the peer), so the same reconstruction applies.
 static void tdeck_rns_on_message(const RNS::Bytes& data, const RNS::Packet& packet) {
     // Acknowledge the packet to the sender. This sends a cryptographic proof
     // back through RNS, which the sender's delivery callback interprets as a
@@ -965,9 +992,21 @@ static void tdeck_rns_on_message(const RNS::Bytes& data, const RNS::Packet& pack
     // bandwidth by not duplicating it). For a packet delivered to our
     // SINGLE lxmf.delivery destination, prepend our destination hash to
     // reconstruct the full LXMF wire format.
+    //
+    // Link-delivered messages (Sideband / NomadNet style) already carry the
+    // full LXMF wire format including the destination hash, because the link
+    // itself carries no addressing. Detect that case and skip the prefix.
     RNS::Bytes lxmf_data;
-    lxmf_data.append(tdeck_rns_msg_dest.hash());
-    lxmf_data.append(data);
+    const size_t dest_len = RNS::Type::Reticulum::DESTINATION_LENGTH;
+    if (data.size() >= 2*dest_len + LXMF::SIGNATURE_LENGTH + 2 &&
+        data.left(dest_len) == tdeck_rns_msg_dest.hash()) {
+        // Already has the destination hash prefix (link-delivered message).
+        lxmf_data.append(data);
+    } else {
+        // Opportunistic single-packet delivery: prepend the destination hash.
+        lxmf_data.append(tdeck_rns_msg_dest.hash());
+        lxmf_data.append(data);
+    }
 
     LXMF::LXMessage msg;
     if (!LXMF::LXMessage::unpack(msg, lxmf_data)) return;
@@ -1139,6 +1178,18 @@ class TDeckAnnounceHandler : public RNS::AnnounceHandler {
     }
 };
 
+// Link-established callback for the local "lxmf.delivery" IN destination.
+// The reference LXMF implementation (Sideband, NomadNet, rnsh, …) delivers
+// messages over an established Link once a path is known, rather than as
+// opportunistic single packets. Without a packet callback on the incoming
+// link, Link::receive() drops the decrypted DATA payload (its
+// CONTEXT_NONE handler only fires callbacks registered on the link). Hook
+// the same LXMF delivery handler that the destination's packet callback
+// uses, so link-delivered messages reach the UI identically.
+static void tdeck_rns_on_link_established(RNS::Link& link) {
+    link.set_packet_callback(tdeck_rns_on_message);
+}
+
 // One-time setup once RNS has started (deferred from tdeck_ui_init because the
 // Reticulum instance comes up later in setup()).
 static void tdeck_rns_setup() {
@@ -1152,6 +1203,7 @@ static void tdeck_rns_setup() {
                                           RNS::Type::Destination::SINGLE,
                                           TDECK_UI_RNS_APP, TDECK_UI_RNS_ASPECT_MSGS);
     tdeck_rns_msg_dest.set_packet_callback(tdeck_rns_on_message);
+    tdeck_rns_msg_dest.set_link_established_callback(tdeck_rns_on_link_established);
     tdeck_rns_msg_dest.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
 
     tdeck_rns_ping_dest = RNS::Destination(id, RNS::Type::Destination::IN,

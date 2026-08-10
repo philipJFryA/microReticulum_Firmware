@@ -855,31 +855,38 @@ int8_t  led_standby_direction = 0;
 #endif
 
 void serial_write(uint8_t byte) {
-	#if MCU_VARIANT == MCU_NATIVE
-		// KISS-over-TCP transport. On native the embedded "Serial" channel
-		// doesn't terminate at a useful host process; the localhost TCP
-		// server in native/TCPHostInterface.cpp carries KISS instead.
-		// Logs (on_log, _write printf) keep going to Serial.
-		native_kiss_tcp::write(byte);
-	#elif HAS_BLUETOOTH || HAS_BLE == true
-		if (bt_state != BT_STATE_CONNECTED) {
-			#if HAS_WIFI
-				if (wifi_host_is_connected()) { wifi_remote_write(byte); }
-				else                          { Serial.write(byte); }
-			#else
-				Serial.write(byte);
-			#endif
-		} else {
-			SerialBT.write(byte);
-      #if MCU_VARIANT == MCU_NRF52 && HAS_BLE
-	      // This ensures that the TX buffer is flushed after a frame is queued in serial.
-	      // serial_in_frame is used to ensure that the flush only happens at the end of the frame
-	      if (serial_in_frame && byte == FEND) { SerialBT.flushTXD(); serial_in_frame = false; }
-	      else if (!serial_in_frame && byte == FEND) { serial_in_frame = true; }
-      #endif
-		}
-	#else
-		Serial.write(byte);
+	// The T-Deck is a self-contained RNS node driven by its own UI; the
+	// legacy RNode KISS-over-serial protocol is not used on this board.
+	// Emitting raw KISS frames here (packet data, stat frames, etc.)
+	// interleaves binary bytes into the readable RNS log stream on the
+	// serial console, so suppress the physical write on the T-Deck only.
+	#if BOARD_MODEL != BOARD_TDECK
+		#if MCU_VARIANT == MCU_NATIVE
+			// KISS-over-TCP transport. On native the embedded "Serial" channel
+			// doesn't terminate at a useful host process; the localhost TCP
+			// server in native/TCPHostInterface.cpp carries KISS instead.
+			// Logs (on_log, _write printf) keep going to Serial.
+			native_kiss_tcp::write(byte);
+		#elif HAS_BLUETOOTH || HAS_BLE == true
+			if (bt_state != BT_STATE_CONNECTED) {
+				#if HAS_WIFI
+					if (wifi_host_is_connected()) { wifi_remote_write(byte); }
+					else                          { Serial.write(byte); }
+				#else
+					Serial.write(byte);
+				#endif
+			} else {
+				SerialBT.write(byte);
+	      #if MCU_VARIANT == MCU_NRF52 && HAS_BLE
+		      // This ensures that the TX buffer is flushed after a frame is queued in serial.
+		      // serial_in_frame is used to ensure that the flush only happens at the end of the frame
+		      if (serial_in_frame && byte == FEND) { SerialBT.flushTXD(); serial_in_frame = false; }
+		      else if (!serial_in_frame && byte == FEND) { serial_in_frame = true; }
+	      #endif
+			}
+		#else
+			Serial.write(byte);
+		#endif
 	#endif
 
 	// WebSocket fan-out: every outbound KISS byte is also offered to the
