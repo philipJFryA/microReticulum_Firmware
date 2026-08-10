@@ -951,7 +951,13 @@ static void tdeck_rns_on_announce(const RNS::Bytes& dst_hash, const RNS::Identit
 // unverified (source identity unknown), mirroring the LXMF reference
 // implementation's SOURCE_UNKNOWN / SIGNATURE_INVALID handling.
 static void tdeck_rns_on_message(const RNS::Bytes& data, const RNS::Packet& packet) {
-    (void)packet;
+    // Acknowledge the packet to the sender. This sends a cryptographic proof
+    // back through RNS, which the sender's delivery callback interprets as a
+    // delivery confirmation (mirrors LXMRouter.delivery_packet which calls
+    // packet.prove() on every LXMF delivery). The Packet callback receives a
+    // const Packet, so we use the const Identity::prove() entry point.
+    const RNS::Identity& local_id = RNS::Transport::identity();
+    if (local_id) local_id.prove(packet);
 
     // The LXMF reference implementation prepends the packet's destination
     // hash to the payload for opportunistic delivery, because the receiver
@@ -1023,6 +1029,18 @@ static void tdeck_rns_on_message(const RNS::Bytes& data, const RNS::Packet& pack
     text[content_len] = '\0';
 
     tdeck_msg_add(contact_hash, text, true);
+
+    // Surface the incoming message in the UI with a toast so the user gets
+    // immediate feedback even when they are not on the Messages screen.
+    tdeck_contact_t* cnt = tdeck_contact_find(contact_hash);
+    if (cnt) {
+        char label[48];
+        tdeck_contact_label(cnt, label, sizeof(label));
+        tdeck_toast_set("Msg from %s", label);
+    } else {
+        tdeck_toast_set("Message received");
+    }
+
     tdeck_dirty = true;
 }
 
