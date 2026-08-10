@@ -58,6 +58,7 @@
 // (RNode_Firmware.ino), so the symbols are defined exactly once.
 #define TDECK_TRACKBALL_IMPLEMENTATION
 #include "TDeckTrackball.h"
+#include "LXMF.h"
 
 // The T-Deck's ST7789 panel is mounted in landscape; the drawing surface is
 // 320x240 (matching display.setRotation(3) configured in Display.h).
@@ -71,14 +72,17 @@
 #define TDECK_LIST_W   (TDECK_SCREEN_W - 2*TDECK_LIST_X)
 
 // ---- RNS app aspects used by the UI -----------------------------------------
-#define TDECK_UI_RNS_APP         "tdeck_ui"
-#define TDECK_UI_RNS_ASPECT_MSGS "messages"
+// The messages app registers the standard LXMF delivery destination so it is
+// interoperable with Sideband, NomadNet, MeshChat and all other LXMF clients.
+// See https://github.com/markqvist/lxmf
+#define TDECK_UI_RNS_APP          LXMF_APP_NAME
+#define TDECK_UI_RNS_ASPECT_MSGS  LXMF_DELIVERY_ASPECT
 #define TDECK_UI_RNS_ASPECT_PING "ping"
 #define TDECK_UI_RNS_ASPECT_BCAST "broadcast"
 
-// Simple line-based payload framing (robust against arbitrary message text).
-#define TDECK_FRAME_MSG  "!mrmsg!"    // !mrmsg!<sender_hash>!<text>
-#define TDECK_FRAME_PING "!mrping!"   // !mrping!<seq>!<sent_at>!<sender_pubkey>
+// Simple line-based payload framing for the ping/trace helpers (not part of
+// the LXMF protocol - these are UI-internal diagnostics).
+#define TDECK_FRAME_PING "!mrping!"   // !mrping!<seq>!<sent_at>!<sender_pubkey>!<sender_dest_hash>
 #define TDECK_FRAME_PONG "!mrpong!"   // !mrpong!<seq>!<sent_at>
 #define TDECK_FRAME_BCAST "!mrbcast!" // !mrbcast!<sender_hash>!<text>
 
@@ -331,7 +335,7 @@ static void     tdeck_rns_setup();
 static void     tdeck_rns_sync_contacts();
 static void     tdeck_rns_announce_ui();
 static bool     tdeck_rns_send_payload(const tdeck_contact_t* c, const char* aspect,
-                                       const char* payload);
+                                       const RNS::Bytes& payload);
 static bool     tdeck_rns_send_broadcast(const char* text);
 static void     tdeck_rns_ping_contact(uint8_t idx);
 static void     tdeck_rns_ping_poll();
@@ -406,6 +410,30 @@ static tdeck_contact_t* tdeck_contact_find(const char* hash_hex) {
     return NULL;
 }
 
+// Announce app_data from Reticulum peers is not always a plain display name:
+// Sideband-style announces can carry binary metadata/control bytes, a newline,
+// and then the actual human-readable name. Extract a clean printable name:
+// the content of the last line (after any embedded newlines), with control
+// characters stripped and surrounding whitespace trimmed.
+static void tdeck_name_clean(const char* raw, char* out, size_t n) {
+    if (!raw) { if (n > 0) out[0] = '\0'; return; }
+    // The human-readable name follows the final newline; everything before it
+    // is metadata/garbage (matches "garbage on first line, name on second").
+    const char* last = raw;
+    for (const char* p = raw; *p; p++) {
+        if (*p == '\n') last = p + 1;
+    }
+    size_t o = 0;
+    for (const char* p = last; *p && o < n - 1; p++) {
+        char ch = *p;
+        if (ch == '\r' || ch == '\n') continue;
+        if (ch >= 0x20 && ch <= 0x7E) out[o++] = ch;  // printable ASCII only
+        // control / high bytes are dropped
+    }
+    while (o > 0 && out[o-1] == ' ') o--;
+    out[o] = '\0';
+}
+
 // Insert or refresh a contact. Missing contacts are appended up to the store
 // limit; existing entries keep their user alias/favourite state.
 static void tdeck_contact_upsert(const char* hash_hex, const char* dest_hex,
@@ -424,15 +452,25 @@ static void tdeck_contact_upsert(const char* hash_hex, const char* dest_hex,
         strncpy(c->pubkey, pubkey_hex, sizeof(c->pubkey)-1);
         c->has_key = true;
     }
-    if (app_data && app_data[0]) strncpy(c->app_data, app_data, sizeof(c->app_data)-1);
+    if (app_data && app_data[0]) {
+        char clean[TDECK_APP_DATA_MAX+1];
+        tdeck_name_clean(app_data, clean, sizeof(clean));
+        if (clean[0]) strncpy(c->app_data, clean, sizeof(c->app_data)-1);
+    }
     if (last_seen > c->last_seen) c->last_seen = last_seen;
 }
 
 // Best display name for a contact: alias, else announced name, else hash.
+// The announced name is cleaned at display time so pre-existing persisted
+// names (saved before the ingest sanitizer existed) still render correctly.
 static const char* tdeck_contact_label(const tdeck_contact_t* c, char* buf, size_t n) {
     if (!c) { snprintf(buf, n, "(none)"); return buf; }
     if (c->alias[0]) { snprintf(buf, n, "%s", c->alias); return buf; }
-    if (c->app_data[0]) { snprintf(buf, n, "%s", c->app_data); return buf; }
+    if (c->app_data[0]) {
+        char clean[TDECK_APP_DATA_MAX+1];
+        tdeck_name_clean(c->app_data, clean, sizeof(clean));
+        if (clean[0]) { snprintf(buf, n, "%s", clean); return buf; }
+    }
     snprintf(buf, n, "%s", c->hash);
     return buf;
 }
@@ -521,9 +559,47 @@ static void tdeck_input_apply() {
             tdeck_toast_set("No key for contact");
             return;
         } else {
-            char frame[TDECK_MSG_MAX_LEN + 64];
-            snprintf(frame, sizeof(frame), "%s%s!%s", TDECK_FRAME_MSG, c->hash, tdeck_input_buf);
-            if (tdeck_rns_send_payload(c, TDECK_UI_RNS_ASPECT_MSGS, frame)) {
+            const RNS::Identity& sender = RNS::Transport::identity();
+            const RNS::Destination& msg_local_dest = tdeck_rns_msg_dest;
+            if (!sender || !msg_local_dest) {
+                tdeck_toast_set("No identity");
+                return;
+            }
+            // Build a standard LXMF message addressed to the peer's
+            // "lxmf.delivery" destination. The destination hash in the LXMF
+            // header is the peer's announced "lxmf.delivery" destination
+            // (computed from their public key), and the source hash is our
+            // own "lxmf.delivery" destination hash. The payload is the
+            // mandatory msgpack [timestamp, title, content, fields] list.
+            RNS::Bytes dest_raw;
+            uint8_t raw_dest[16];
+            if (c->dest_hash[0] && tdeck_hex_decode(c->dest_hash, raw_dest, 16)) {
+                dest_raw = RNS::Bytes(raw_dest, 16);
+            } else {
+                // Fall back to the deterministic lxmf.delivery hash computed
+                // from the contact's public key — this is what Sideband
+                // addresses when the announce destination is unknown.
+                uint8_t key[64];
+                if (!tdeck_hex_decode(c->pubkey, key, 64)) {
+                    tdeck_toast_set("No key for contact");
+                    return;
+                }
+                RNS::Identity rid(false);
+                rid.load_public_key(RNS::Bytes(key, 64));
+                dest_raw = RNS::Destination::hash(rid, LXMF_APP_NAME, LXMF_DELIVERY_ASPECT);
+            }
+
+            // The source hash is our own lxmf.delivery destination hash.
+            RNS::Bytes source_raw = msg_local_dest.hash();
+
+            RNS::Bytes lxmf_packed;
+            if (!LXMF::LXMessage::pack(lxmf_packed, dest_raw, source_raw,
+                                        sender, tdeck_input_buf)) {
+                tdeck_toast_set("Pack failed");
+                return;
+            }
+            if (tdeck_rns_send_payload(c, TDECK_UI_RNS_ASPECT_MSGS,
+                                       lxmf_packed)) {
                 tdeck_msg_add(c->hash, tdeck_input_buf, false);
                 tdeck_toast_set("Message sent");
             } else {
@@ -605,7 +681,11 @@ static void tdeck_settings_apply_contact(const char* hash, const char* alias,
         strncpy(c->pubkey, pubkey, sizeof(c->pubkey)-1);
         c->has_key = true;
     }
-    if (app_data && app_data[0]) strncpy(c->app_data, app_data, sizeof(c->app_data)-1);
+    if (app_data && app_data[0]) {
+        char clean[TDECK_APP_DATA_MAX+1];
+        tdeck_name_clean(app_data, clean, sizeof(clean));
+        if (clean[0]) strncpy(c->app_data, clean, sizeof(c->app_data)-1);
+    }
 }
 
 // Strip surrounding quotes from a YAML scalar value (in place at *start).
@@ -834,30 +914,115 @@ static void tdeck_rns_on_announce(const RNS::Bytes& dst_hash, const RNS::Identit
         strncpy(hash, dest, sizeof(hash)-1);
     }
     if (app_data.size() > 0) {
-        std::string ad = app_data.toString();
-        strncpy(appd, ad.c_str(), sizeof(appd)-1);
+        // LXMF announces encode the display name as the first element of a
+        // msgpack array: [display_name, stamp_cost, [supported_features]].
+        // Decode it - if the data isn't a valid LXMF announce array, fall
+        // back to the legacy raw-text handling for plain Reticulum peers.
+        std::vector<uint8_t> lxmf_name;
+        bool lxmf_decoded = LXMF::announce_display_name(app_data.data(),
+                                                        app_data.size(),
+                                                        lxmf_name);
+        if (lxmf_decoded) {
+            size_t n = lxmf_name.size();
+            if (n > TDECK_APP_DATA_MAX) n = TDECK_APP_DATA_MAX;
+            if (n > 0) {
+                memcpy(appd, lxmf_name.data(), n);
+                appd[n] = '\0';
+            }
+        } else {
+            std::string ad = app_data.toString();
+            strncpy(appd, ad.c_str(), sizeof(appd)-1);
+        }
     }
     tdeck_contact_upsert(hash, dest, pub[0] ? pub : NULL, appd, RNS::Utilities::OS::time());
     tdeck_dirty = true;
 }
 
-// Packet callback for the local "tdeck_ui.messages" IN destination.
+// Packet callback for the local "lxmf.delivery" IN destination.
+//
+// Per the LXMF specification, an opportunistic single-packet message carries
+// the following wire layout (the destination hash is prepended from the
+// packet header by the receiver, matching LXMRouter.delivery_packet):
+//   dest_hash(16) || source_hash(16) || signature(64) ||
+//   msgpack([timestamp, title, content, fields])
+//
+// The signature is verified with the sender's public key recalled via RNS
+// from the source hash. Unverifiable messages are accepted but flagged as
+// unverified (source identity unknown), mirroring the LXMF reference
+// implementation's SOURCE_UNKNOWN / SIGNATURE_INVALID handling.
 static void tdeck_rns_on_message(const RNS::Bytes& data, const RNS::Packet& packet) {
     (void)packet;
-    std::string s = data.toString();
-    if (s.rfind(TDECK_FRAME_MSG, 0) != 0) return;
-    const char* p = s.c_str() + strlen(TDECK_FRAME_MSG);
 
-    char sender[40];
-    p = tdeck_rns_field(p, 0, sender, sizeof(sender));
-    if (!p || !sender[0]) return;
+    // The LXMF reference implementation prepends the packet's destination
+    // hash to the payload for opportunistic delivery, because the receiver
+    // knows the destination from the packet header (and the sender saves
+    // bandwidth by not duplicating it). For a packet delivered to our
+    // SINGLE lxmf.delivery destination, prepend our destination hash to
+    // reconstruct the full LXMF wire format.
+    RNS::Bytes lxmf_data;
+    lxmf_data.append(tdeck_rns_msg_dest.hash());
+    lxmf_data.append(data);
 
+    LXMF::LXMessage msg;
+    if (!LXMF::LXMessage::unpack(msg, lxmf_data)) return;
+
+    // Extract the sender identity hash (hex) from the LXMF source hash.
+    std::string source_hex = msg.source_hash.toHex();
+
+    // Attempt to recall the sender identity for signature verification.
+    // The source hash is the sender's lxmf.delivery destination hash;
+    // RNS can recall the identity from the announce that carried it.
+    char sender[40] = {0};
+    strncpy(sender, source_hex.c_str(), sizeof(sender)-1);
+
+    RNS::Identity source_identity = {RNS::Type::NONE};
+    // We may not be able to recall the identity if the announce was heard
+    // but the identity store isn't seeded yet. In that case, accept the
+    // message without signature verification (matches LXMF's tolerance of
+    // SOURCE_UNKNOWN messages when the destination identity is unknown).
+    bool signature_valid = false;
+    if (msg.source_hash) {
+        source_identity = RNS::Identity::recall(msg.source_hash);
+        if (source_identity) {
+            signature_valid = LXMF::LXMessage::verify(msg, source_identity);
+        }
+    }
+
+    // Upsert the contact under the signed identity if we could verify it,
+    // otherwise under the source hash.
+    char contact_hash[40] = {0};
+    if (signature_valid && source_identity) {
+        std::string ih = source_identity.hash().toHex();
+        strncpy(contact_hash, ih.c_str(), sizeof(contact_hash)-1);
+    } else {
+        strncpy(contact_hash, sender, sizeof(contact_hash)-1);
+    }
+
+    // The sender's announced destination hash is the LXMF source hash
+    // (their lxmf.delivery destination). Store it for reply routing.
+    tdeck_contact_upsert(contact_hash, sender, NULL, NULL, 0);
+
+    // If we recalled the identity, we have the public key - persist it so
+    // replies can be encrypted.
+    if (source_identity) {
+        std::string pk = source_identity.get_public_key().toHex();
+        tdeck_contact_t* cnt = tdeck_contact_find(contact_hash);
+        if (cnt) {
+            strncpy(cnt->pubkey, pk.c_str(), sizeof(cnt->pubkey)-1);
+            cnt->has_key = true;
+        }
+    }
+
+    // Extract message content as text.
     char text[TDECK_MSG_MAX_LEN+1];
-    strncpy(text, p, sizeof(text)-1);
-    text[sizeof(text)-1] = '\0';
+    size_t content_len = msg.content.size();
+    if (content_len > TDECK_MSG_MAX_LEN) content_len = TDECK_MSG_MAX_LEN;
+    if (content_len > 0) {
+        memcpy(text, msg.content.data(), content_len);
+    }
+    text[content_len] = '\0';
 
-    tdeck_contact_upsert(sender, NULL, NULL, NULL, 0);
-    tdeck_msg_add(sender, text, true);
+    tdeck_msg_add(contact_hash, text, true);
     tdeck_dirty = true;
 }
 
@@ -896,21 +1061,31 @@ static void tdeck_rns_on_ping(const RNS::Bytes& data, const RNS::Packet& packet)
     std::string s = data.toString();
 
     if (s.rfind(TDECK_FRAME_PING, 0) == 0) {
-        char seq[16], sent[24], pub[140];
+        char seq[16], sent[24], pub[140], sender_dest[40];
         const char* p = s.c_str() + strlen(TDECK_FRAME_PING);
         p = tdeck_rns_field(p, 0, seq, sizeof(seq));
         if (!p) return;
         p = tdeck_rns_field(p, 0, sent, sizeof(sent));
         if (!p) return;
-        if (!tdeck_rns_field(p, 0, pub, sizeof(pub)) || strlen(pub) != 128) return;
+        p = tdeck_rns_field(p, 0, pub, sizeof(pub));
+        if (!p || strlen(pub) != 128) return;
+        // sender_dest is the final field: tdeck_rns_field returns NULL for the
+        // last field (no trailing '!') but still copies the bytes, so we must
+        // NOT treat a NULL return as failure here.
+        tdeck_rns_field(p, 0, sender_dest, sizeof(sender_dest));
+        if (strlen(sender_dest) != 32) return;
 
-        // Reply to whoever pinged us using the public key carried in the frame.
-        uint8_t key[64];
+        // Reply to whoever pinged us: build a destination addressed to the
+        // announced destination the sender listens on (carried in frame) and
+        // encrypted with the sender's public key (also carried in frame) so
+        // the sender's SINGLE destination can decrypt the PONG.
+        uint8_t key[64], dest_raw[16];
         if (!tdeck_hex_decode(pub, key, 64)) return;
+        if (!tdeck_hex_decode(sender_dest, dest_raw, 16)) return;
         RNS::Identity rid(false);
         rid.load_public_key(RNS::Bytes(key, 64));
-        RNS::Destination out(rid, RNS::Type::Destination::OUT, RNS::Type::Destination::SINGLE,
-                             TDECK_UI_RNS_APP, TDECK_UI_RNS_ASPECT_PING);
+        RNS::Destination out(rid, RNS::Type::Destination::OUT,
+                             RNS::Type::Destination::SINGLE, RNS::Bytes(dest_raw, 16));
         char pong[64];
         snprintf(pong, sizeof(pong), "%s%s!%s", TDECK_FRAME_PONG, seq, sent);
         RNS::Packet(out, RNS::Bytes(pong)).send();
@@ -1013,11 +1188,30 @@ static bool tdeck_rns_send_broadcast(const char* text) {
 // Re-announce the UI destinations (used at startup and when the name changes).
 // PLAIN broadcast destinations cannot be announced, so only the SINGLE
 // destinations are re-announced here.
+//
+// The LXMF announce app_data is msgpack-encoded as:
+//   [display_name, stamp_cost, [supported_functionality]]
+// matching LXMRouter.get_announce_app_data() in the reference implementation.
+// This makes the T-Deck discoverable by Sideband, NomadNet and all other
+// LXMF clients, which decode the display name from the array.
 static void tdeck_rns_announce_ui() {
     if (!tdeck_rns_ready) return;
-    RNS::Bytes name(tdeck_set_device_name);
-    if (tdeck_rns_msg_dest)  tdeck_rns_msg_dest.announce(name);
-    if (tdeck_rns_ping_dest) tdeck_rns_ping_dest.announce(name);
+
+    // Build LXMF-compatible announce app_data:
+    //   [display_name(bin/str), stamp_cost(nil), [SF_COMPRESSION]]
+    arduino::msgpack::Packer packer;
+    packer.reserve_buffer(128);
+    std::vector<uint8_t> name(tdeck_set_device_name,
+                              tdeck_set_device_name + strlen(tdeck_set_device_name));
+    // stamp_cost is nil (no stamping required); supported functionality
+    // advertises SF_COMPRESSION like the reference implementation.
+    arduino::msgpack::object::nil_t stamp_cost;
+    std::vector<uint8_t> sf_list = {LXMF::SF_COMPRESSION};
+    packer.to_array(name, stamp_cost, sf_list);
+    RNS::Bytes app_data(packer.data(), packer.size());
+
+    if (tdeck_rns_msg_dest)  tdeck_rns_msg_dest.announce(app_data);
+    if (tdeck_rns_ping_dest) tdeck_rns_ping_dest.announce(app_data);
     tdeck_last_announce_at = RNS::Utilities::OS::time();
 }
 
@@ -1045,9 +1239,18 @@ static void tdeck_rns_sync_contacts() {
     tdeck_dirty = true;
 }
 
-// Send an arbitrary framed payload to a contact's destination for `aspect`.
+// Send an arbitrary payload to a contact's destination for `aspect`.
+// The destination is the deterministic per-identity hash of `<app>.<aspect>`
+// — the exact hash the peer registered and announced. For messages this is
+// the standard LXMF "lxmf.delivery" destination, making the T-Deck
+// interoperable with all LXMF clients. The ping aspect is a UI-internal
+// diagnostic destination.
+//
+// The payload is passed as RNS::Bytes (not const char*) because LXMF wire
+// data is binary and may contain embedded NUL bytes; the old str-based
+// overload would truncate at the first zero byte.
 static bool tdeck_rns_send_payload(const tdeck_contact_t* c, const char* aspect,
-                                   const char* payload) {
+                                   const RNS::Bytes& payload) {
     if (!tdeck_rns_ready) return false;
     if (!c || !c->has_key || !c->pubkey[0]) return false;
     uint8_t key[64];
@@ -1055,9 +1258,17 @@ static bool tdeck_rns_send_payload(const tdeck_contact_t* c, const char* aspect,
 
     RNS::Identity rid(false);
     rid.load_public_key(RNS::Bytes(key, 64));
-    RNS::Destination out(rid, RNS::Type::Destination::OUT, RNS::Type::Destination::SINGLE,
-                         TDECK_UI_RNS_APP, aspect);
-    RNS::Packet(out, RNS::Bytes(payload)).send();
+    // Deterministic per-peer, per-aspect destination hash. Both ends
+    // compute the same value from the same public key and aspect, so frames
+    // address exactly the destination the peer registered and announced.
+    RNS::Bytes aspect_hash = RNS::Destination::hash(rid, TDECK_UI_RNS_APP, aspect);
+    if (aspect_hash.size() != RNS::Type::Reticulum::DESTINATION_LENGTH) return false;
+
+    // Encrypt with the contact's public key (their SINGLE destination requires
+    // it) and address to the aspect hash.
+    RNS::Destination out(rid, RNS::Type::Destination::OUT,
+                         RNS::Type::Destination::SINGLE, aspect_hash);
+    RNS::Packet(out, payload).send();
     return true;
 }
 
@@ -1072,10 +1283,19 @@ static void tdeck_rns_ping_contact(uint8_t idx) {
     strncpy(tdeck_ping_peer, c->hash, sizeof(tdeck_ping_peer)-1);
     tdeck_ping_seq++;
 
-    char frame[256];
-    snprintf(frame, sizeof(frame), "%s%08x!%.3f!%s", TDECK_FRAME_PING, tdeck_ping_seq,
-             RNS::Utilities::OS::time(), c->pubkey);
-    if (!tdeck_rns_send_payload(c, TDECK_UI_RNS_ASPECT_PING, frame)) {
+    const RNS::Identity& self = RNS::Transport::identity();
+    const RNS::Destination& local_dest = tdeck_rns_ping_dest;
+    if (!self || !local_dest) {
+        snprintf(tdeck_ping_status, sizeof(tdeck_ping_status), "No identity");
+        return;
+    }
+    // Carry our announced destination hash so the responder can route the
+    // PONG back to the exact destination we are listening on.
+    char frame[256 + 40];
+    snprintf(frame, sizeof(frame), "%s%08x!%.3f!%s!%s", TDECK_FRAME_PING, tdeck_ping_seq,
+             RNS::Utilities::OS::time(), self.get_public_key().toHex().c_str(),
+             local_dest.hash().toHex().c_str());
+    if (!tdeck_rns_send_payload(c, TDECK_UI_RNS_ASPECT_PING, RNS::Bytes(frame))) {
         snprintf(tdeck_ping_status, sizeof(tdeck_ping_status), "Send failed");
         return;
     }
@@ -1516,7 +1736,11 @@ static void tdeck_ui_draw_contacts() {
             c.setCursor(TDECK_LIST_X, y); c.print("Name: "); c.print(label); y += 12;
             c.setTextColor(TDECK_COL_DIM);
             c.setCursor(TDECK_LIST_X, y); c.print("Hash: "); c.print(ct->hash); y += 12;
-            if (ct->app_data[0]) { c.setCursor(TDECK_LIST_X, y); c.print("Ann: "); c.print(ct->app_data); y += 12; }
+            if (ct->app_data[0]) {
+                char clean[TDECK_APP_DATA_MAX+1];
+                tdeck_name_clean(ct->app_data, clean, sizeof(clean));
+                c.setCursor(TDECK_LIST_X, y); c.print("Ann: "); c.print(clean); y += 12;
+            }
             if (ct->has_key)  { c.setCursor(TDECK_LIST_X, y); c.print("Key: yes"); }
             else              { c.setCursor(TDECK_LIST_X, y); c.print("Key: no announce yet"); }
             y += 12;
