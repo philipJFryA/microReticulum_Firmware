@@ -10,15 +10,22 @@
 // The UI is organised around a home screen (app launcher) with a top status
 // bar that is ALWAYS visible on every screen:
 //
-//   * time (RNS system clock, GPS-disciplined when a fix is held, otherwise
-//     uptime when no real-time clock is present)
-//   * GPS status indicator ("n/a" = no receiver, "--" = acquiring,
-//     "3D" = fix held) — an L76K or other NMEA-0183 GNSS on UART1
-//     (GPIO 43/44) is parsed by TDeckGPS.h; the fix is published to peers
-//     through the LXMF announce payload and, once its UTC epoch reaches RNS,
-//     drives the status bar clock.
-//   * Reticulum status (transport on/off, radio state, peer count)
-//   * battery percentage
+//   * node name (truncated to 16 characters, drawn on the left)
+//   * right-justified cluster:
+//       - battery percentage
+//       - time (RNS system clock, GPS-disciplined when a fix is held,
+//         otherwise uptime when no real-time clock is present)
+//       - GPS satellite icon (green = lock held, yellow = hardware
+//         responding but no lock, red = hardware not responding/init failure)
+//       - Reticulum cell tower (green = any traffic from another node
+//         within the last 5 minutes, yellow = radio online but mesh quiet,
+//         red = hardware failure)
+//       - direct (1-hop) connection count, immediately right of the cell tower
+//
+// The GNSS is an L76K or other NMEA-0183 receiver on UART1 (GPIO 43/44)
+// parsed by TDeckGPS.h; the fix is published to peers through the LXMF
+// announce payload and, once its UTC epoch reaches RNS, drives the status
+// bar clock.
 //
 // Four applications are provided, navigated with the trackball (scroll,
 // press = select, left = back, long press = home) and the keyboard
@@ -208,6 +215,7 @@ typedef struct {
   bool  has_key;
   bool  persisted;             // present in settings.yaml
   double last_seen;            // unix time of last announce
+  uint32_t last_seen_ms;       // millis() of last announce heard (direct-count)
   float lat;                   // last announced position (0 = unknown)
   float lon;
   float alt;
@@ -254,6 +262,7 @@ static bool     tdeck_gps_time_set   = false;  // GNSS UTC epoch applied to RNS 
 static bool     tdeck_gps_announced  = false;  // first-fix announce already sent
 static uint32_t tdeck_last_tick      = 0;
 static uint32_t tdeck_tick_ms        = 1000;
+static uint32_t tdeck_ui_start_ms    = 0;      // set once in tdeck_ui_init()
 
 // Screens
 enum {
@@ -305,6 +314,8 @@ static RNS::Destination tdeck_rns_bcast_dest({RNS::Type::NONE});
 static RNS::HAnnounceHandler tdeck_rns_ann_handler;
 static bool tdeck_rns_ready = false;
 static double tdeck_last_announce_at = 0.0;
+static uint32_t tdeck_last_rx_count = 0;    // last seen RNS::Transport::packets_received()
+static uint32_t tdeck_last_rx_ms    = 0;    // millis() of last packet received from another node
 #endif
 
 // ping/trace UI state (declared unconditionally: the draw code reads them even
@@ -355,6 +366,9 @@ static bool     tdeck_rns_send_broadcast(const char* text);
 static void     tdeck_rns_ping_contact(uint8_t idx);
 static void     tdeck_rns_ping_poll();
 static void     tdeck_rns_trace_contact(uint8_t idx);
+#ifdef HAS_RNS
+static uint8_t  tdeck_direct_count();
+#endif
 
 static void     tdeck_ui_draw_status_bar(TDeckCanvas& c);
 static void     tdeck_ui_draw_footer(TDeckCanvas& c, const char* hint);
@@ -1031,6 +1045,8 @@ static void tdeck_rns_on_announce(const RNS::Bytes& dst_hash, const RNS::Identit
                                           peer_sat, peer_age);
     }
     tdeck_contact_upsert(hash, dest, pub[0] ? pub : NULL, appd, RNS::Utilities::OS::time());
+    tdeck_contact_t* up = tdeck_contact_find(hash);
+    if (up) up->last_seen_ms = millis();
 
     // Store the decoded position on the contact.
     if (has_loc) {
@@ -1568,73 +1584,136 @@ static void tdeck_rns_trace_contact(uint8_t idx) {
 
 // ---- Drawing helpers ---------------------------------------------------------
 
-// Top status bar: node name, GPS indicator, Reticulum indicator, clock and
-// battery. Drawn on every screen.
+// Small satellite glyph for the GPS status indicator. The whole icon (antenna
+// tip + mast, central body, and two solar panels) is drawn in `color` so GPS
+// state is conveyed by colour: green = lock held, yellow = hardware present
+// but no lock, red = hardware not responding, dim = disabled.
+static void tdeck_draw_gps_icon(TDeckCanvas& c, int16_t x, int16_t y, uint16_t color) {
+    // Antenna mast + tip
+    c.drawFastVLine(x, y - 3, 2, color);
+    c.fillCircle(x, y - 4, 1, color);
+    // Solar panels (left + right) joined to the body by a top bar
+    c.fillRect(x - 4, y - 1, 3, 2, color);
+    c.fillRect(x + 2, y - 1, 3, 2, color);
+    c.drawFastHLine(x - 4, y - 1, 9, color);
+    // Central body
+    c.fillRect(x - 1, y - 1, 2, 3, color);
+}
+
+// Small cell-tower glyph for the Reticulum/LoRa mesh status indicator. The
+// tower (three antenna stubs, mast, lattice legs and cross-ties) is drawn in
+// `color` so mesh state is conveyed by colour: green = any traffic from
+// another node heard within the last 5 minutes, yellow = radio online but
+// mesh quiet, red = hardware failure, dim = not online yet.
+static void tdeck_draw_cell_tower_icon(TDeckCanvas& c, int16_t x, int16_t y, uint16_t color) {
+    // Three antenna stubs at the top
+    c.drawFastHLine(x - 4, y - 4, 3, color);
+    c.drawFastHLine(x - 1, y - 4, 3, color);
+    c.drawFastHLine(x + 2, y - 4, 3, color);
+    // Mast
+    c.drawFastVLine(x, y - 3, 3, color);
+    // Lattice legs forming a triangle
+    c.drawLine(x - 3, y - 1, x, y + 2, color);
+    c.drawLine(x + 3, y - 1, x, y + 2, color);
+    // Cross-ties
+    c.drawFastHLine(x - 2, y, 5, color);
+    c.drawFastHLine(x - 3, y + 2, 7, color);
+}
+
+// Top status bar: node name (truncated to 16 chars) on the left; right-justified
+// battery percentage, clock, a GPS satellite indicator, a Reticulum cell-tower
+// indicator, and the direct (1-hop) connection count. Drawn on every screen.
 static void tdeck_ui_draw_status_bar(TDeckCanvas& c) {
     c.fillRect(0, 0, TDECK_SCREEN_W, TDECK_SBAR_H, TDECK_COL_SBAR);
     c.drawFastHLine(0, TDECK_SBAR_H - 1, TDECK_SCREEN_W, TDECK_COL_DIM);
     c.setTextSize(1);
-    c.setTextColor(TDECK_COL_FG);
 
-    // Node name (left)
+    // Node name (left, truncated to 16 characters)
+    c.setTextColor(TDECK_COL_FG);
     c.setCursor(TDECK_LIST_X, TDECK_SBAR_H / 2 - 4);
-    char name[20];
-    strncpy(name, tdeck_set_device_name, sizeof(name)-1);
-    name[sizeof(name)-1] = '\0';
+    char name[17];
+    strncpy(name, tdeck_set_device_name, sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
     c.print(name);
 
-    // Reticulum status block
-    int x = TDECK_LIST_X + 16 * 6;
-    uint16_t rns_col = TDECK_COL_ERR;
-    const char* rns_txt = "RNS off";
+    // Right-justified status cluster built right-to-left:
+    //   [battery%] [clock] [GPS icon] [cell tower] [direct count]
+    int x  = TDECK_SCREEN_W - TDECK_LIST_X;  // right edge
+    int cy = TDECK_SBAR_H / 2;
+
+    // Direct connection count -- immediately to the right of the cell tower.
+    uint8_t direct = 0;
   #ifdef HAS_RNS
-    if (tdeck_rns_ready) {
-        rns_col = TDECK_COL_OK;
-        rns_txt = "RNS on";
-    }
-  #else
-    (void)rns_col;
-    (void)rns_txt;
+    direct = tdeck_direct_count();
   #endif
-    c.fillCircle(x + 3, TDECK_SBAR_H / 2, 3, rns_col);
-    c.setCursor(x + 9, TDECK_SBAR_H / 2 - 4);
-    c.print(rns_txt);
-
-    // GPS status block
-    x += 9 + strlen(rns_txt) * 6;
-    const char* gps_txt = "GPS n/a";
-    uint16_t gps_col = TDECK_COL_DIM;
-    if (!tdeck_set_gps_enabled) {
-        gps_txt = "GPS off";
-        gps_col = TDECK_COL_DIM;
-    } else if (tdeck_gps_present) {
-        if (tdeck_gps_fix) { gps_txt = "GPS 3D"; gps_col = TDECK_COL_OK; }
-        else               { gps_txt = "GPS --"; gps_col = TDECK_COL_WARN; }
-    }
-    c.setTextColor(gps_col);
+    char direct_txt[8];
+    snprintf(direct_txt, sizeof(direct_txt), "%u", (unsigned)direct);
+    x -= strlen(direct_txt) * 6;
+    c.setTextColor(direct > 0 ? TDECK_COL_ACCENT : TDECK_COL_DIM);
     c.setCursor(x, TDECK_SBAR_H / 2 - 4);
-    c.print(gps_txt);
+    c.print(direct_txt);
 
-    // Clock (right of GPS)
+    // Reticulum/LoRa cell tower: green = any traffic from another node
+    // heard within the last 5 minutes, yellow = radio online but mesh quiet,
+    // red = hardware failure, dim = radio not online yet.
+    x -= 10;  // 9px icon + 1px gap before the count
+    bool lora_failed = !modem_installed || (radio_error && !radio_online);
+    bool lora_active = false;
+  #ifdef HAS_RNS
+    // millis()-based so activity works even before the RNS clock is
+    // GPS-disciplined (OS::time() returns small uptime values until then).
+    if (tdeck_last_rx_ms > 0 && (millis() - tdeck_last_rx_ms) < 300000UL) {
+        lora_active = true;
+    }
+  #endif
+    uint16_t lora_col;
+    if (lora_failed) {
+        lora_col = TDECK_COL_ERR;
+    } else if (radio_online) {
+        lora_col = lora_active ? TDECK_COL_OK : TDECK_COL_WARN;
+    } else {
+        lora_col = TDECK_COL_DIM;  // not online yet
+    }
+    tdeck_draw_cell_tower_icon(c, x, cy, lora_col);
+
+    // GPS status: green = 3D lock, yellow = hardware responding but no lock,
+    // red = hardware not responding (init failure), dim = disabled. Drawn as
+    // a small satellite icon that takes on the state colour.
+    x -= 10;  // 9px icon + 1px so a 3px gap remains before the LoRa dot
+    uint16_t gps_col;
+    if (!tdeck_set_gps_enabled) {
+        gps_col = TDECK_COL_DIM;
+    } else if (tdeck_gps_fix) {
+        gps_col = TDECK_COL_OK;
+    } else if (tdeck_gps_present ||
+               (millis() - tdeck_ui_start_ms) < 5000) {
+        gps_col = TDECK_COL_WARN;  // present but no lock, or still initialising
+    } else {
+        gps_col = TDECK_COL_ERR;
+    }
+    tdeck_draw_gps_icon(c, x, cy, gps_col);
+
+    // Clock
+    x -= 6;  // gap before the GPS icon
     char timestr[16];
     tdeck_ui_time_str(timestr, sizeof(timestr));
-    x += strlen(gps_txt) * 6 + 8;
+    x -= strlen(timestr) * 6;
     c.setTextColor(TDECK_COL_FG);
     c.setCursor(x, TDECK_SBAR_H / 2 - 4);
     c.print(timestr);
 
-    // Battery (right-aligned)
+    // Battery percentage (right-justified, left of clock)
     char bat[8];
     if (battery_ready) {
         snprintf(bat, sizeof(bat), "%u%%", (uint8_t)(battery_percent + 0.5f));
     } else {
         snprintf(bat, sizeof(bat), "--%%");
     }
-    int bat_x = TDECK_SCREEN_W - TDECK_LIST_X - strlen(bat) * 6;
-    c.setCursor(bat_x, TDECK_SBAR_H / 2 - 4);
+    x -= 6;  // gap before the clock
+    x -= strlen(bat) * 6;
+    c.setTextColor(TDECK_COL_FG);
+    c.setCursor(x, TDECK_SBAR_H / 2 - 4);
     c.print(bat);
-    c.drawRect(TDECK_SCREEN_W - TDECK_LIST_X - 4, TDECK_SBAR_H / 2 - 6, 9, 12, TDECK_COL_FG);
-    c.fillRect(TDECK_SCREEN_W - TDECK_LIST_X - 4, TDECK_SBAR_H / 2 - 8, 9, 2, TDECK_COL_FG);
 }
 
 // Bottom hint bar with an optional transient toast message.
@@ -1989,24 +2068,42 @@ static void tdeck_ui_draw_contacts() {
 }
 
 #ifdef HAS_RNS
-// Count directly reachable destinations (1 hop) from the transport path table.
+// Count directly reachable destinations (1 hop): peers whose announce has been
+// heard within the last 5 minutes, excluding our own echoed identity. On a
+// LoRa broadcast medium anything heard is inherently one hop, so recent
+// announces are the correct "direct connection" signal -- the RNS path table
+// is not reliably populated by announces alone.
 static uint8_t tdeck_direct_count() {
     uint8_t n = 0;
-    for (auto it = RNS::Transport::path_table().begin(); it != RNS::Transport::path_table().end(); ++it) {
-        if (it->second._hops <= 1) n++;
+    const RNS::Identity& self = RNS::Transport::identity();
+    for (uint8_t i = 0; i < tdeck_contact_count; i++) {
+        // Skip our own identity: our announces echo back and would otherwise
+        // inflate the count.
+        if (self && strcmp(tdeck_contacts[i].hash, self.hash().toHex().c_str()) == 0) continue;
+        // Count nodes whose announce was heard within the last 5 minutes.
+        // On a LoRa broadcast medium anything heard is a direct (1-hop)
+        // neighbour, so a recent announce is the correct "direct connection"
+        // signal -- the RNS path table is not reliably populated by
+        // announces alone.
+        if (tdeck_contacts[i].last_seen_ms > 0 &&
+            (millis() - tdeck_contacts[i].last_seen_ms) < 300000UL) {
+            n++;
+        }
     }
     return n;
 }
 
 static bool tdeck_direct_at(uint8_t idx, char* out, size_t n, uint8_t* hops) {
     uint8_t seen = 0;
-    for (auto it = RNS::Transport::path_table().begin(); it != RNS::Transport::path_table().end(); ++it) {
-        if (it->second._hops <= 1) {
+    const RNS::Identity& self = RNS::Transport::identity();
+    for (uint8_t i = 0; i < tdeck_contact_count; i++) {
+        if (self && strcmp(tdeck_contacts[i].hash, self.hash().toHex().c_str()) == 0) continue;
+        if (tdeck_contacts[i].last_seen_ms > 0 &&
+            (millis() - tdeck_contacts[i].last_seen_ms) < 300000UL) {
             if (seen == idx) {
-                std::string h = it->first.toHex();
-                strncpy(out, h.c_str(), n - 1);
+                strncpy(out, tdeck_contacts[i].hash, n - 1);
                 out[n-1] = '\0';
-                if (hops) *hops = it->second._hops;
+                if (hops) *hops = 1;  // LoRa: anything heard is direct
                 return true;
             }
             seen++;
@@ -2202,7 +2299,7 @@ static void tdeck_set_row(uint8_t idx, char* label, size_t n, char* value, size_
         case 0: snprintf(label, n, "Node name");   snprintf(value, vn, "%s", tdeck_set_device_name); *action = true; break;
         case 1: snprintf(label, n, "Brightness");  snprintf(value, vn, "%u", tdeck_set_brightness);   *action = false; break;
         case 2: snprintf(label, n, "Blank timeout"); snprintf(value, vn, "%us", tdeck_set_blank_timeout); *action = false; break;
-        case 3: snprintf(label, n, "Show GPS");    snprintf(value, vn, "%s", tdeck_set_gps_enabled ? "yes" : "no"); *action = false; break;
+        case 3: snprintf(label, n, "Location Enabled"); snprintf(value, vn, "%s", tdeck_set_gps_enabled ? "yes" : "no"); *action = false; break;
         case 4: {
             snprintf(label, n, "Timezone");
             int h = tdeck_set_tz_offset_min / 60;
@@ -2948,12 +3045,20 @@ void tdeck_ui_init() {
     tdeck_settings_load();
     tdeck_apply_brightness();
 
+    // Location is now final (default or loaded from settings.yaml). When
+    // disabled, immediately put the GNSS hardware into standby so it draws
+    // no tracking current instead of merely ignoring its output.
+    if (!tdeck_set_gps_enabled) {
+        tdeck_gps.standby();
+    }
+
     // Seed the rnodeconf-style EEPROM identity so the device is provisioned
     // like every other board in the repo (must run before validate_status()).
     tdeck_eeprom_provision();
 
     tdeck_ui_ready = true;
     tdeck_dirty = true;
+    tdeck_ui_start_ms = millis();
     tdeck_last_tick = millis();
     tdeck_ui_go_home();
 }
@@ -3038,10 +3143,30 @@ void tdeck_ui_loop() {
             tdeck_rns_announce_ui();
         }
     }
+
+    // Track any traffic received from other nodes so the status bar can show
+    // mesh activity (green cell tower) within the last 5 minutes. The
+    // transport-level RX counter increments for every packet the LoRa
+    // interface receives -- announces, proofs, propagation and data alike --
+    // which is exactly "any traffic from another node heard". The timestamp
+    // is millis()-based (not RNS wall time) so activity is detected even
+    // before a GPS-disciplined clock has been applied to RNS.
+    if (tdeck_rns_ready) {
+        uint32_t rx = RNS::Transport::packets_received();
+        if (rx != tdeck_last_rx_count) {
+            tdeck_last_rx_count = rx;
+            tdeck_last_rx_ms = millis();
+        }
+    }
   #endif
 
     // Poll the GPS/GNSS UART and keep the status bar + RNS announce in sync.
     if (tdeck_set_gps_enabled) {
+        // Wake the receiver once if it was put to standby (boot-disabled, or
+        // toggled off then back on in Settings).
+        if (tdeck_gps.asleep()) {
+            tdeck_gps.wake();
+        }
         tdeck_gps.loop();
 
         // A module has been detected once any NMEA traffic arrives.
@@ -3068,7 +3193,9 @@ void tdeck_ui_loop() {
         }
       #endif
     } else {
-        // GPS disabled in settings: drop any stale indication.
+        // GPS disabled in settings: put the receiver hardware into standby
+        // (idempotent) and drop any stale UI indication.
+        tdeck_gps.standby();
         if (tdeck_gps_present) { tdeck_gps_present = false; tdeck_gps_fix = false; tdeck_dirty = true; }
     }
 

@@ -64,7 +64,57 @@ class TDeckGPS {
                  _last_fix_ms(0), _lat(0.0f), _lon(0.0f), _alt(0.0f),
                  _speed_kmh(0.0f), _course(0.0f),
                  _epoch_valid(false), _epoch_s(0), _epoch_fresh_ms(0),
-                 _nmea_seen(false), _debug_last_fix(false), _baud(9600) {}
+                 _nmea_seen(false), _debug_last_fix(false), _baud(9600),
+                 _asleep(false) {}
+
+    // Put the GNSS receiver into low-power standby ($PCAS05 move mode 2).
+    // Idempotent: a second call while already asleep is a no-op. The L76K
+    // remains powered but stops satellite tracking and NMEA emission, which
+    // cuts the continuous acquisition current (roughly 15-20 mA) when the
+    // user disables Location in Settings.
+    bool standby() {
+      if (_asleep) return true;
+      if (_send_cmd("$PCAS05,2*1A\r\n")) {
+        _asleep = true;
+        _debug("[GPS] standby");
+        return true;
+      }
+      return false;
+    }
+
+    // Wake the GNSS receiver from standby ($PCAS05 move mode 0 / continuous).
+    // Re-applies the constellation, NMEA sentence set and the 10-second
+    // position output rate so the module returns to the exact same state it
+    // was configured to at begin(). Idempotent.
+    bool wake() {
+      if (!_asleep) return true;
+      // Move mode 0 = continuous (standby off).
+      if (_send_cmd("$PCAS05,0*18\r\n")) {
+        _asleep = false;
+        // Re-apply the L76K profile so a runtime re-enable restores the same
+        // configuration the boot path established.
+        const char* cfg[] = {
+          "$PCAS04,5*1C\r\n",                // GPS + GLONASS constellation
+          "$PCAS03,1,1,1,1,1,1,1,1,1,1,,,0,0*02\r\n",  // full NMEA sentence set
+          "$PCAS02,10000*1E\r\n",            // one position per 10 s
+        };
+        for (size_t i = 0; i < sizeof(cfg)/sizeof(cfg[0]); i++) {
+          _send_cmd(cfg[i]);
+          delay(250);
+        }
+        _debug("[GPS] wake");
+        return true;
+      }
+      return false;
+    }
+
+    // True when the receiver is currently in standby.
+    bool asleep() const { return _asleep; }
+
+    // Send a 10-second NMEA output rate ($PCAS02 first field = ms).
+    bool _set_rate_10s() {
+      return _send_cmd("$PCAS02,10000*1E\r\n");
+    }
 
     void begin() {
       // UART1 (RX from GPS on GPIO 44, TX to GPS on GPIO 43).
@@ -78,6 +128,8 @@ class TDeckGPS {
 
       if (_init_l76k()) {
         _debug("[GPS] L76K detected and configured (GPS+GLONASS, NMEA out)");
+        _set_rate_10s();
+        _debug("[GPS] NMEA output set to 1 fix / 10 s");
         return;
       }
 
@@ -97,6 +149,8 @@ class TDeckGPS {
         // success there too). The module now emits standard GGA/RMC NMEA on
         // this same UART, so the driver's polling loop picks it straight up.
         _debug("[GPS] UBX recovery succeeded, staying at 38400 baud (NMEA out)");
+        _set_rate_10s();
+        _debug("[GPS] NMEA output set to 1 fix / 10 s");
         return;
       }
 
@@ -108,6 +162,23 @@ class TDeckGPS {
 
     // Current UART baud used by the active GPS configuration.
     uint32_t baud() const { return _baud; }
+    // -------- low-level helpers --------
+
+    // Write a NMEA command to the receiver and consume any echoed bytes so
+    // the polling loop doesn't mistake them for navigation data.
+    bool _send_cmd(const char* cmd) {
+      Serial1.print(cmd);
+      Serial1.flush();
+      // Drain whatever the module echoes back (the $GPTXT / $PCAS replies).
+      uint32_t until = millis() + 100;
+      while ((int32_t)(millis() - until) < 0) {
+        while (Serial1.available() > 0) {
+          Serial1.read();
+          _nmea_seen = true;
+        }
+      }
+      return true;
+    }
     // -------- bootstrap helpers --------
 
     // (Re)open the GPS UART at the given baud.
@@ -349,6 +420,7 @@ class TDeckGPS {
     bool     _nmea_seen;
     bool     _debug_last_fix;
     uint32_t _baud;
+    bool     _asleep;
 
     // -------- tiny helpers (no String heap inside the fast path) --------
 
