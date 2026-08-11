@@ -28,8 +28,10 @@
 // bar clock.
 //
 // Four applications are provided, navigated with the trackball (scroll,
-// press = select, left = back, long press = home) and the keyboard
-// (printable keys type, Enter = confirm, Backspace = delete, Esc = back):
+// press = enter, left = back, long press = home) and the keyboard
+// (W/A/S/D = scroll up/left/down/right, Enter = confirm, Backspace =
+// back/delete). Key-based navigation never exits a text field; only the
+// trackball-left event leaves text input.
 //
 //   1. Messages   - send/receive point-to-point text messages to other nodes
 //                   running this UI over the "tdeck_ui.messages" aspect
@@ -60,6 +62,10 @@
 #include <SD.h>
 #ifdef ESP_PLATFORM
   #include <esp_heap_caps.h>
+  // ROM miniz/tinfl raw-deflate inflater used by the SAR PNG tile decoder.
+  // The ROM symbols are mapped at link time via esp32s3.rom.ld - no external
+  // PNG/zlib library is needed.
+  #include "rom/miniz.h"
 #endif
 
 #include "TDeckKeyboard.h"
@@ -99,6 +105,34 @@
 #define TDECK_FRAME_PING "!mrping!"   // !mrping!<seq>!<sent_at>!<sender_pubkey>!<sender_dest_hash>
 #define TDECK_FRAME_PONG "!mrpong!"   // !mrpong!<seq>!<sent_at>
 #define TDECK_FRAME_BCAST "!mrbcast!" // !mrbcast!<sender_hash>!<text>
+
+// ---- SAR (Situational Awareness) app ------------------------------------------
+// The SAR app shares periodic encrypted position beacons with a configured set
+// of peer nodes over the "tdeck_ui.sar.position" aspect, and renders a map of
+// the local mesh on the T-Deck screen.
+//
+// Map tiles are stored on the microSD card using the standard XYZ (slippy map)
+// scheme under /tiles/{zoom}/{x}/{y}.png. Standard XYZ tile PNGs are decoded
+// directly on the ESP32-S3 using the ROM's miniz/tinfl inflate (no external
+// PNG library dependency); the x/y coordinates are standard Web Mercator
+// (OSM-style) tile indices. Tiles can be provisioned over USB serial or the
+// WebSocket console, or fetched over WiFi (when connected) from any
+// XYZ-compatible tile server.
+#define TDECK_SAR_RNS_ASPECT    "sar.position"
+#define TDECK_SAR_FRAME_POS     "!mrsar!"   // !mrsar!<sender_hash>!<lat>!<lon>!<alt>!<sat>!<age>
+#define TDECK_SAR_MAX_PEERS     8
+#define TDECK_SAR_MAX_TRACKS    24
+#define TDECK_SAR_TRACK_TIMEOUT (60*30)     // seconds; drop tracks not updated
+#define TDECK_SAR_DEFAULT_INTERVAL 60       // seconds between beacons
+#define TDECK_SAR_TILE_ROOT     "/tiles"
+#define TDECK_SAR_TILE_EXT      ".png"
+#define TDECK_TILE_SIZE         256
+#define TDECK_SAR_MIN_ZOOM      3
+#define TDECK_SAR_MAX_ZOOM      18
+#define TDECK_SAR_MAP_X         2           // map viewport origin (below status bar)
+#define TDECK_SAR_MAP_Y         (TDECK_SBAR_H + 2)
+#define TDECK_SAR_MAP_W         (TDECK_SCREEN_W - 2*TDECK_SAR_MAP_X)
+#define TDECK_SAR_MAP_H         (TDECK_SCREEN_H - TDECK_SAR_MAP_Y - TDECK_FOOT_H - 26 - 2)
 
 // Broadcast conversation sentinel peer (not a contact hash: "bcast" is not
 // a 32-char hex string, so it can never collide with a real identity hash).
@@ -271,6 +305,7 @@ enum {
   SCREEN_CONTACTS,
   SCREEN_RETICULUM,
   SCREEN_SETTINGS,
+  SCREEN_SAR,
 };
 
 // Per-app views
@@ -279,11 +314,50 @@ enum { CT_LIST = 0, CT_DETAIL, CT_ALIAS };
 enum { RET_MENU = 0, RET_PING_PICK, RET_PING_RUN, RET_TRACE_PICK,
        RET_TRACE_RUN, RET_DIRECT, RET_IDENTITY, RET_NAME_EDIT };
 enum { SET_LIST = 0, SET_EDIT };
+// SAR: map view, peer list, contact picker, SAR config list, value editor
+enum { SAR_MAP = 0, SAR_PEERS, SAR_PICK, SAR_CFG, SAR_CFG_EDIT };
 
 static uint8_t tdeck_screen = SCREEN_HOME;
 static uint8_t tdeck_sub    = 0;
 static uint8_t tdeck_cursor = 0;
 static uint8_t tdeck_scroll = 0;
+
+// ---- SAR (Situational Awareness) state ---------------------------------------
+// Beacon peers are contacts the user has explicitly selected to share
+// encrypted position beacons with. The list is persisted to settings.yaml
+// as the "sar_peers:" section.
+static char     tdeck_sar_peers[TDECK_SAR_MAX_PEERS][40];
+static uint8_t  tdeck_sar_peer_count   = 0;
+static uint16_t tdeck_sar_interval     = TDECK_SAR_DEFAULT_INTERVAL; // seconds
+static uint8_t  tdeck_sar_send_enabled = 1;
+
+// Map view state (Web Mercator / XYZ).
+static int64_t  tdeck_sar_center_lat_e7 = 0;  // centre position, 1e7 fixed point
+static int64_t  tdeck_sar_center_lon_e7 = 0;
+static uint8_t  tdeck_sar_zoom          = 14;
+static int32_t  tdeck_sar_pan_px_x      = 0;  // pan offset from the tile origin
+static int32_t  tdeck_sar_pan_px_y      = 0;
+static bool     tdeck_sar_has_centre    = false;
+
+// Position tracks (per beacon peer, most recent position). The beacon frame
+// carries an age so the renderer can grey stale nodes.
+typedef struct {
+  char     hash[40];
+  float    lat;
+  float    lon;
+  double   last_heard;       // RNS unix time
+  uint32_t last_heard_ms;    // millis() of last beacon
+  uint32_t seq;              // sender's beacon sequence
+} tdeck_sar_track_t;
+static tdeck_sar_track_t tdeck_sar_tracks[TDECK_SAR_MAX_PEERS];
+static uint8_t tdeck_sar_track_count = 0;
+
+// SAR beacon pacing (millis-based so it works before GPS-disciplined clock).
+static uint32_t tdeck_sar_last_beacon_ms = 0;
+static uint32_t tdeck_sar_last_ui_action_ms = 0; // pan/zoom pacing
+
+// Inbox scratch for the SAR peer picker (contact indices to choose from).
+static uint8_t tdeck_sar_pick_contact_idx = 0;
 
 // Back-stack (small fixed depth; long-press also returns to home)
 #define TDECK_NAV_DEPTH 8
@@ -306,11 +380,19 @@ static uint32_t tdeck_toast_until = 0;
 // Settings app scratch
 static uint8_t  tdeck_set_edit_idx = 0;   // row being edited in SET_EDIT
 
+// SAR contact picker scratch (index of the currently browsed contact)
+static uint8_t tdeck_sar_picker_cursor = 0;
+static uint8_t tdeck_sar_picker_scroll = 0;
+// SAR "Add peer" contact picker (separate from the browse list above)
+static uint8_t tdeck_sar_pick_contact_cursor = 0;
+static uint8_t tdeck_sar_pick_contact_scroll = 0;
+
 // ---- RNS integration state ---------------------------------------------------
 #ifdef HAS_RNS
 static RNS::Destination tdeck_rns_msg_dest({RNS::Type::NONE});
 static RNS::Destination tdeck_rns_ping_dest({RNS::Type::NONE});
 static RNS::Destination tdeck_rns_bcast_dest({RNS::Type::NONE});
+static RNS::Destination tdeck_rns_sar_dest({RNS::Type::NONE});
 static RNS::HAnnounceHandler tdeck_rns_ann_handler;
 static bool tdeck_rns_ready = false;
 static double tdeck_last_announce_at = 0.0;
@@ -374,6 +456,8 @@ static void     tdeck_ui_draw_status_bar(TDeckCanvas& c);
 static void     tdeck_ui_draw_footer(TDeckCanvas& c, const char* hint);
 static void     tdeck_ui_draw_row(TDeckCanvas& c, uint8_t y, const char* text,
                                   bool selected);
+static uint8_t  tdeck_ui_list_frame(TDeckCanvas& c, const char* title, uint8_t n,
+                                    uint8_t cursor, uint8_t* scroll);
 static void     tdeck_ui_draw_home();
 static void     tdeck_ui_draw_messages();
 static void     tdeck_ui_draw_contacts();
@@ -381,6 +465,7 @@ static void     tdeck_ui_draw_reticulum();
 static void     tdeck_ui_draw_reticulum_rest();
 static void     tdeck_ui_draw_settings();
 static void     tdeck_ui_draw_text_input(const char* title, const char* buf);
+static void     tdeck_ui_draw_sar();
 static void     tdeck_ui_draw();
 
 static void     tdeck_ui_go_home();
@@ -1273,6 +1358,125 @@ static void tdeck_rns_on_ping(const RNS::Bytes& data, const RNS::Packet& packet)
     }
 }
 
+// --- SAR (Situational Awareness) RNS integration -----
+
+// True when `send_enabled` and at least one configured peer exists.
+static bool tdeck_sar_active() {
+    return tdeck_sar_send_enabled && tdeck_sar_peer_count > 0;
+}
+
+// Find the index of a configured SAR beacon peer by hash, or -1.
+static int8_t tdeck_sar_peer_index(const char* hash) {
+    if (!hash) return -1;
+    for (uint8_t i = 0; i < tdeck_sar_peer_count; i++) {
+        if (strcmp(tdeck_sar_peers[i], hash) == 0) return (int8_t)i;
+    }
+    return -1;
+}
+
+// Packet callback for the local "tdeck_ui.sar.position" IN destination.
+// Receives encrypted position beacons from configured peers:
+//   !mrsar!<sender_hash>!<lat>!<lon>!<alt>!<sat>!<age_s>
+// Frame is line-based text (encrypted by RNS for the SINGLE destination),
+// so data.toString() is safe.
+static void tdeck_rns_on_sar_position(const RNS::Bytes& data, const RNS::Packet& packet) {
+    (void)packet;
+    std::string s = data.toString();
+    if (s.rfind(TDECK_SAR_FRAME_POS, 0) != 0) return;
+    const char* p = s.c_str() + strlen(TDECK_SAR_FRAME_POS);
+
+    char sender[40];
+    p = tdeck_rns_field(p, 0, sender, sizeof(sender));
+    if (!p || strlen(sender) != 32) return;
+
+    char lat_s[24], lon_s[24], alt_s[24], sat_s[16], age_s[24];
+    p = tdeck_rns_field(p, 0, lat_s, sizeof(lat_s));
+    if (!p) return;
+    p = tdeck_rns_field(p, 0, lon_s, sizeof(lon_s));
+    if (!p) return;
+    p = tdeck_rns_field(p, 0, alt_s, sizeof(alt_s));
+    if (!p) return;
+    p = tdeck_rns_field(p, 0, sat_s, sizeof(sat_s));
+    if (!p) return;
+    tdeck_rns_field(p, 0, age_s, sizeof(age_s));   // last field (may be empty)
+
+    float lat = strtof(lat_s, NULL);
+    float lon = strtof(lon_s, NULL);
+    if (lat == 0.0f && lon == 0.0f) return;         // not a real position
+
+    // Upsert the sender into the contact store (beacons also teach peers).
+    tdeck_contact_upsert(sender, NULL, NULL, NULL, 0);
+
+    // Update (or create) the track for this sender.
+    tdeck_sar_track_t* tr = NULL;
+    for (uint8_t i = 0; i < tdeck_sar_track_count; i++) {
+        if (strcmp(tdeck_sar_tracks[i].hash, sender) == 0) { tr = &tdeck_sar_tracks[i]; break; }
+    }
+    if (!tr) {
+        if (tdeck_sar_track_count >= TDECK_SAR_MAX_PEERS) return;
+        tr = &tdeck_sar_tracks[tdeck_sar_track_count++];
+        memset(tr, 0, sizeof(*tr));
+        strncpy(tr->hash, sender, sizeof(tr->hash)-1);
+    }
+    tr->lat = lat;
+    tr->lon = lon;
+    tr->last_heard = RNS::Utilities::OS::time();
+    tr->last_heard_ms = millis();
+
+    // Centre the map on the first position received.
+    if (!tdeck_sar_has_centre) {
+        tdeck_sar_has_centre = true;
+        tdeck_sar_center_lat_e7 = (int64_t)(lat * 10000000.0);
+        tdeck_sar_center_lon_e7 = (int64_t)(lon * 10000000.0);
+        tdeck_sar_pan_px_x = 0;
+        tdeck_sar_pan_px_y = 0;
+    }
+    tdeck_dirty = true;
+}
+
+// Drop stale tracks whose beacon age exceeds TDECK_SAR_TRACK_TIMEOUT.
+static void tdeck_sar_expire_tracks() {
+    for (uint8_t i = 0; i < tdeck_sar_track_count; ) {
+        if (millis() - tdeck_sar_tracks[i].last_heard_ms > (uint32_t)TDECK_SAR_TRACK_TIMEOUT * 1000) {
+            memmove(&tdeck_sar_tracks[i], &tdeck_sar_tracks[i+1],
+                    sizeof(tdeck_sar_track_t) * (tdeck_sar_track_count - i - 1));
+            tdeck_sar_track_count--;
+        } else {
+            i++;
+        }
+    }
+}
+
+// Send our current GPS fix to every configured SAR peer (encrypted via the
+// deterministic per-peer, per-aspect destination). Does nothing without a
+// fresh fix, configured peers, or when transmissions are disabled.
+static void tdeck_rns_sar_beacon() {
+    if (!tdeck_rns_ready) return;
+    if (!tdeck_sar_active()) return;
+    if (!tdeck_gps_present || !tdeck_gps_fix) return;
+    float lat = tdeck_gps.latitude();
+    float lon = tdeck_gps.longitude();
+    if (lat == 0.0f && lon == 0.0f) return;
+
+    const RNS::Identity& id = RNS::Transport::identity();
+    if (!id) return;
+
+    char frame[160];
+    uint32_t age = (millis() - tdeck_gps.lastFixMs()) / 1000;
+    snprintf(frame, sizeof(frame), "%s%s!%.5f!%.5f!%.0f!%u!%lu",
+             TDECK_SAR_FRAME_POS, id.hash().toHex().c_str(),
+             (double)lat, (double)lon, (double)tdeck_gps.altitude(),
+             (unsigned)tdeck_gps.satellites(), (unsigned long)age);
+
+    RNS::Bytes payload(frame);
+    uint8_t sent = 0;
+    for (uint8_t i = 0; i < tdeck_sar_peer_count; i++) {
+        tdeck_contact_t* c = tdeck_contact_find(tdeck_sar_peers[i]);
+        if (c && tdeck_rns_send_payload(c, TDECK_SAR_RNS_ASPECT, payload)) sent++;
+    }
+    if (sent > 0) tdeck_sar_last_beacon_ms = millis();
+}
+
 class TDeckAnnounceHandler : public RNS::AnnounceHandler {
   public:
     TDeckAnnounceHandler() : RNS::AnnounceHandler() {}
@@ -1332,6 +1536,15 @@ static void tdeck_rns_setup() {
                                             TDECK_UI_RNS_APP, TDECK_UI_RNS_ASPECT_BCAST);
     tdeck_rns_bcast_dest.set_packet_callback(tdeck_rns_on_broadcast);
     tdeck_rns_bcast_dest.set_proof_strategy(RNS::Type::Destination::PROVE_NONE);
+
+    // Encrypted SAR position-beacon destination (per-node identity). Peers
+    // that have this node's public key (from the announce) can send us
+    // encrypted position beacons via the deterministic per-peer aspect hash.
+    tdeck_rns_sar_dest = RNS::Destination(id, RNS::Type::Destination::IN,
+                                          RNS::Type::Destination::SINGLE,
+                                          TDECK_UI_RNS_APP, TDECK_SAR_RNS_ASPECT);
+    tdeck_rns_sar_dest.set_packet_callback(tdeck_rns_on_sar_position);
+    tdeck_rns_sar_dest.set_proof_strategy(RNS::Type::Destination::PROVE_ALL);
 
     tdeck_rns_ann_handler = RNS::HAnnounceHandler(new TDeckAnnounceHandler());
     RNS::Transport::register_announce_handler(tdeck_rns_ann_handler);
@@ -1582,6 +1795,513 @@ static void tdeck_rns_trace_contact(uint8_t idx) {
 
 #endif // HAS_RNS
 
+// ---- SAR map rendering -------------------------------------------------------
+// Web Mercator (EPSG:3857) projection helpers for XYZ/slippy map tiles.
+// The world fits in one 256x256 tile at zoom 0. Coordinates use the standard
+// OSM formula; lat/lon are in degrees.
+static int64_t tdeck_sar_lon_to_tile_x(double lon, uint8_t zoom) {
+    if (lon <= -180.0) lon = -180.0;
+    if (lon >= 180.0)  lon = 180.0;
+    double n = pow(2.0, (double)zoom);
+    return (int64_t)floor((lon + 180.0) / 360.0 * n);
+}
+static int64_t tdeck_sar_lat_to_tile_y(double lat, uint8_t zoom) {
+    if (lat <= -85.05112878) lat = -85.05112878;
+    if (lat >=  85.05112878) lat =  85.05112878;
+    double n = pow(2.0, (double)zoom);
+    double lat_rad = lat * (PI / 180.0);
+    return (int64_t)floor((1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / PI) / 2.0 * n);
+}
+static double tdeck_sar_tile_x_to_lon(int64_t x, uint8_t zoom) {
+    double n = pow(2.0, (double)zoom);
+    return x / n * 360.0 - 180.0;
+}
+static double tdeck_sar_tile_y_to_lat(int64_t y, uint8_t zoom) {
+    double n = pow(2.0, (double)zoom);
+    double lat_rad = atan(sinh(PI * (1.0 - 2.0 * y / n)));
+    return lat_rad * (180.0 / PI);
+}
+
+// Convert a lat/lon to a pixel offset within the whole Web Mercator world at
+// the given zoom (0,0 = top-left of the world tile).
+static void tdeck_sar_latlon_to_world_px(double lat, double lon, uint8_t zoom,
+                                         double& px, double& py) {
+    double n = pow(2.0, (double)zoom);
+    double tx = (lon + 180.0) / 360.0 * n;
+    double lat_rad = lat * (PI / 180.0);
+    double ty = (1.0 - log(tan(lat_rad) + 1.0 / cos(lat_rad)) / PI) / 2.0 * n;
+    px = tx * TDECK_TILE_SIZE;
+    py = ty * TDECK_TILE_SIZE;
+}
+
+// Convert a world pixel back to lat/lon.
+static void tdeck_sar_world_px_to_latlon(double px, double py, uint8_t zoom,
+                                         double& lat, double& lon) {
+    double n = pow(2.0, (double)zoom);
+    double tx = px / (double)TDECK_TILE_SIZE;
+    double ty = py / (double)TDECK_TILE_SIZE;
+    lon = tx / n * 360.0 - 180.0;
+    double lat_rad = atan(sinh(PI * (1.0 - 2.0 * ty / n)));
+    lat = lat_rad * (180.0 / PI);
+}
+
+// Decode a PNG tile (256x256) from the SD card into the given 256x256 RGB565
+// buffer. Returns true on success. The canvas is RGB565 big-endian (Adafruit
+// drawRGBBitmap order), so each pixel is byte-swapped before storing.
+//
+// PNG decoding uses the ESP32-S3 ROM's miniz/tinfl raw-deflate inflater
+// (tinfl_decompress_mem_to_mem, mapped from the ROM at runtime via
+// esp32s3.rom.ld) - no external PNG library is needed. Standard XYZ tile
+// PNGs (8-bit RGB, RGBA, palette or grayscale) are handled directly.
+static bool tdeck_sar_load_tile_png(int64_t tx, int64_t ty, uint8_t zoom,
+                                    uint16_t* out) {
+    if (!tdeck_sd_ready) return false;
+    if (zoom < TDECK_SAR_MIN_ZOOM || zoom > TDECK_SAR_MAX_ZOOM) return false;
+    uint32_t n = 1UL << zoom;
+    if (tx < 0 || ty < 0 || tx >= (int64_t)n || ty >= (int64_t)n) return false;
+
+    char path[64];
+    snprintf(path, sizeof(path), "%s/%u/%lld/%lld%s",
+             TDECK_SAR_TILE_ROOT, (unsigned)zoom,
+             (long long)tx, (long long)ty, TDECK_SAR_TILE_EXT);
+    if (!SD.exists(path)) return false;
+    File f = SD.open(path, FILE_READ);
+    if (!f) return false;
+
+    // The whole PNG file is read into a heap buffer (usually a few KB for a
+    // 256x256 OSM tile). The buffer is heap-allocated (not a big stack array)
+    // so the RNS low-memory watchdog never trips on deep call chains (LoRa RX
+    // interrupt path → map renderer).
+    uint32_t fsize = f.size();
+    if (fsize < 64 || fsize > (512 * 1024)) { f.close(); return false; }
+    uint8_t* file = (uint8_t*)malloc(fsize);
+    if (!file) { f.close(); return false; }
+    if (f.read(file, fsize) != fsize) { free(file); f.close(); return false; }
+    f.close();
+
+    // ---- PNG signature + IHDR ----
+    static const uint8_t png_magic[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (fsize < 24 || memcmp(file, png_magic, 8) != 0) { free(file); return false; }
+
+    // IHDR: 4-byte length + "IHDR" + 13 bytes payload
+    uint32_t ihdr_len = ((uint32_t)file[8] << 24) | ((uint32_t)file[9] << 16) |
+                        ((uint32_t)file[10] << 8) | (uint32_t)file[11];
+    if (ihdr_len < 13 || file[12] != 'I' || file[13] != 'H' ||
+        file[14] != 'D' || file[15] != 'R') { free(file); return false; }
+    uint32_t png_w = ((uint32_t)file[16] << 24) | ((uint32_t)file[17] << 16) |
+                     ((uint32_t)file[18] << 8) | (uint32_t)file[19];
+    uint32_t png_h = ((uint32_t)file[20] << 24) | ((uint32_t)file[21] << 16) |
+                     ((uint32_t)file[22] << 8) | (uint32_t)file[23];
+    uint8_t bit_depth = file[24];
+    uint8_t color_type = file[25];
+    uint8_t compression = file[26];
+    uint8_t filter_method = file[27];
+    uint8_t interlace = file[28];
+
+    if (png_w != TDECK_TILE_SIZE || png_h != TDECK_TILE_SIZE) { free(file); return false; }
+    if (bit_depth != 8) { free(file); return false; }
+    // OSM/XYZ tiles: 0 = grey, 2 = RGB, 3 = palette, 4 = grey+alpha, 6 = RGBA
+    if (color_type != 0 && color_type != 2 && color_type != 3 &&
+        color_type != 4 && color_type != 6) { free(file); return false; }
+    if (compression != 0 || filter_method != 0 || interlace != 0) { free(file); return false; }
+
+    // ---- Parse chunks to collect PLTE/tRNS and concatenated IDAT ----
+    uint8_t palette[768] = {0};
+    uint8_t palette_alpha[256] = {0};
+    bool has_plte = false;
+    bool has_trans = false;
+    uint8_t* idat = NULL;         // concatenated IDAT payloads (zlib stream)
+    uint32_t idat_total = 0;      // bytes currently in `idat`
+    uint32_t idat_cap = 0;        // allocated size of `idat`
+    uint32_t pos = 8;
+
+    while (pos + 8 <= fsize) {
+        uint32_t clen = ((uint32_t)file[pos] << 24) | ((uint32_t)file[pos + 1] << 16) |
+                        ((uint32_t)file[pos + 2] << 8) | (uint32_t)file[pos + 3];
+        uint32_t ctype = ((uint32_t)file[pos + 4] << 24) | ((uint32_t)file[pos + 5] << 16) |
+                         ((uint32_t)file[pos + 6] << 8) | (uint32_t)file[pos + 7];
+        if (pos + 12 + clen > fsize) { free(file); free(idat); return false; }
+
+        if (ctype == 0x504C5445) {  // "PLTE"
+            if (clen > 768) { free(file); free(idat); return false; }
+            memcpy(palette, file + pos + 8, clen);
+            has_plte = true;
+        } else if (ctype == 0x74524E53) {  // "tRNS"
+            if (clen > 256) { free(file); free(idat); return false; }
+            memcpy(palette_alpha, file + pos + 8, clen);
+            has_trans = true;
+        } else if (ctype == 0x49444154) {  // "IDAT" - append payload
+            // All IDAT chunks are consecutive by spec; concatenate them all
+            // into one zlib stream before inflating.
+            if (idat_total + clen < idat_total) { free(file); free(idat); return false; } // overflow
+            if (idat_total + clen > idat_cap) {
+                uint32_t new_cap = idat_cap ? idat_cap * 2 : 4096;
+                while (new_cap < idat_total + clen) new_cap *= 2;
+                uint8_t* nidat = (uint8_t*)realloc(idat, new_cap);
+                if (!nidat) { free(file); free(idat); return false; }
+                idat = nidat;
+                idat_cap = new_cap;
+            }
+            memcpy(idat + idat_total, file + pos + 8, clen);
+            idat_total += clen;
+        }
+        pos += 12 + clen;
+    }
+
+    if (idat_total == 0) { free(file); free(idat); return false; }
+
+    // ---- zlib header: strip 2-byte header + 4-byte adler32 footer ----
+    if (idat_total < 6) { free(file); free(idat); return false; }
+    // Verify the zlib header: CMF & FLG (0x78 0x01/0x5E/0x9C/0xDA)
+    if ((idat[0] & 0x0F) != 8 || (idat[0] >> 4) > 7) { free(file); free(idat); return false; }
+    if (((idat[0] * 256 + idat[1]) % 31) != 0) { free(file); free(idat); return false; }
+    const uint8_t* inflate_src = idat + 2;
+    uint32_t inflate_len = idat_total - 6;
+
+    // Raw scanline size (pre-filter) for 8-bit channels.
+    uint8_t channels = 1;
+    if (color_type == 2 || color_type == 4) channels = 3;
+    else if (color_type == 6) channels = 4;
+    uint16_t row_bpp = (uint16_t)(TDECK_TILE_SIZE * channels);
+    uint32_t out_bytes = (uint32_t)(row_bpp + 1) * TDECK_TILE_SIZE;
+
+    uint8_t* raw = (uint8_t*)malloc(out_bytes);
+    if (!raw) { free(file); free(idat); return false; }
+
+  #ifdef ESP_PLATFORM
+    // Use the ROM miniz/tinfl to inflate the raw deflate stream.
+    size_t got = tinfl_decompress_mem_to_mem(raw, out_bytes,
+                                             inflate_src, inflate_len,
+                                             TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    if (got != out_bytes) { free(raw); free(file); free(idat); return false; }
+  #else
+    // Non-ESP32 fallback: PNG tiles are not supported (BMP was used on
+    // platforms without the ROM inflater).
+    free(raw); free(file); free(idat); return false;
+  #endif
+
+    // ---- Unfilter + convert to RGB565 ----
+    uint8_t bpp = channels;  // bytes per pixel for the Sub/Paeth filters
+    uint8_t* prev = (uint8_t*)calloc(row_bpp, 1);
+    if (!prev) { free(raw); free(file); free(idat); return false; }
+
+    for (uint32_t y = 0; y < TDECK_TILE_SIZE; y++) {
+        uint8_t* line = raw + (uint32_t)y * (row_bpp + 1);
+        uint8_t filt = line[0];
+        uint8_t* cur = line + 1;
+
+        // Apply the PNG scanline filter in place (bpp = bytes per pixel).
+        if (filt == 1) {  // Sub
+            for (int32_t i = bpp; i < (int32_t)row_bpp; i++)
+                cur[i] = (uint8_t)(cur[i] + cur[i - bpp]);
+        } else if (filt == 2) {  // Up
+            for (int32_t i = 0; i < (int32_t)row_bpp; i++)
+                cur[i] = (uint8_t)(cur[i] + prev[i]);
+        } else if (filt == 3) {  // Average
+            for (int32_t i = 0; i < (int32_t)row_bpp; i++) {
+                uint8_t left = (i >= bpp) ? cur[i - bpp] : 0;
+                cur[i] = (uint8_t)(cur[i] + ((left + prev[i]) >> 1));
+            }
+        } else if (filt == 4) {  // Paeth
+            for (int32_t i = 0; i < (int32_t)row_bpp; i++) {
+                uint8_t a = (i >= bpp) ? cur[i - bpp] : 0;
+                uint8_t b = prev[i];
+                uint8_t c = (i >= bpp) ? prev[i - bpp] : 0;
+                int32_t p = (int32_t)a + b - c;
+                int32_t pa = abs(p - a);
+                int32_t pb = abs(p - b);
+                int32_t pc = abs(p - c);
+                uint8_t pred;
+                if (pa <= pb && pa <= pc) pred = a;
+                else if (pb <= pc) pred = b;
+                else pred = c;
+                cur[i] = (uint8_t)(cur[i] + pred);
+            }
+        }
+
+        // Convert this row's pixels to RGB565.
+        uint16_t* dst = out + ((int32_t)y * TDECK_TILE_SIZE);
+        for (uint32_t x = 0; x < TDECK_TILE_SIZE; x++) {
+            uint8_t r, g, b;
+            if (color_type == 0) {         // grayscale
+                r = g = b = cur[x];
+            } else if (color_type == 2) {  // RGB
+                r = cur[x * 3 + 0];
+                g = cur[x * 3 + 1];
+                b = cur[x * 3 + 2];
+            } else if (color_type == 3) {  // palette
+                uint8_t idx = cur[x];
+                if (has_trans && idx < 256 && palette_alpha[idx] == 0) {
+                    r = g = b = 255;       // fully transparent -> white
+                } else {
+                    uint32_t base = (uint32_t)idx * 3;
+                    if (has_plte && base + 2 < 768) {
+                        r = palette[base + 0];
+                        g = palette[base + 1];
+                        b = palette[base + 2];
+                    } else {
+                        r = g = b = 0;
+                    }
+                }
+            } else if (color_type == 4) {  // grayscale + alpha
+                r = g = b = cur[x * 2];
+                // ignore alpha (tiles are opaque)
+            } else {                       // RGBA (6)
+                r = cur[x * 4 + 0];
+                g = cur[x * 4 + 1];
+                b = cur[x * 4 + 2];
+            }
+            uint16_t rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+            dst[x] = (rgb565 >> 8) | (rgb565 << 8);   // big-endian for GFX
+        }
+        memcpy(prev, cur, row_bpp);
+    }
+
+    free(prev);
+    free(raw);
+    free(idat);
+    free(file);
+    return true;
+}
+
+// Render the map viewport onto the main canvas. The viewport shows the
+// tiles around the current centre at tdeck_sar_zoom, shifted by the pan
+// offset. Positions from the local GPS fix and peer tracks are overlaid.
+static void tdeck_ui_draw_sar_map(TDeckCanvas& c) {
+    // If we have no centre yet, fall back to the GPS fix if one exists.
+    if (!tdeck_sar_has_centre && tdeck_gps_present && tdeck_gps_fix) {
+        tdeck_sar_has_centre = true;
+        tdeck_sar_center_lat_e7 = (int64_t)(tdeck_gps.latitude() * 10000000.0);
+        tdeck_sar_center_lon_e7 = (int64_t)(tdeck_gps.longitude() * 10000000.0);
+        tdeck_sar_pan_px_x = 0;
+        tdeck_sar_pan_px_y = 0;
+    }
+
+    // Map background (dark).
+    c.fillRect(TDECK_SAR_MAP_X, TDECK_SAR_MAP_Y, TDECK_SAR_MAP_W, TDECK_SAR_MAP_H, 0x0861);
+
+    if (tdeck_sar_has_centre) {
+        // World pixel of the centre at the current zoom.
+        double cx_world, cy_world;
+        tdeck_sar_latlon_to_world_px(tdeck_sar_center_lat_e7 / 10000000.0,
+                                     tdeck_sar_center_lon_e7 / 10000000.0,
+                                     tdeck_sar_zoom, cx_world, cy_world);
+        // Viewport top-left world pixel = centre - half viewport + pan.
+        double vp_x = cx_world - TDECK_SAR_MAP_W / 2.0 + tdeck_sar_pan_px_x;
+        double vp_y = cy_world - TDECK_SAR_MAP_H / 2.0 + tdeck_sar_pan_px_y;
+
+        int64_t t0x = (int64_t)floor(vp_x / TDECK_TILE_SIZE);
+        int64_t t0y = (int64_t)floor(vp_y / TDECK_TILE_SIZE);
+        int64_t t1x = (int64_t)floor((vp_x + TDECK_SAR_MAP_W) / TDECK_TILE_SIZE);
+        int64_t t1y = (int64_t)floor((vp_y + TDECK_SAR_MAP_H) / TDECK_TILE_SIZE);
+
+        // Tile cache (PSRAM-backed, reused across frames to avoid SD re-reads).
+        // The 128 KB RGB565 tile buffer would otherwise live in internal
+        // SRAM and starve the RNS heap (LOW-MEMORY watchdog reset) — a
+        // lazy PSRAM allocation keeps it out of the 512 KB internal DRAM.
+        static uint16_t* tile_cache = NULL;
+        static int64_t   cache_tx = -1, cache_ty = -1;
+        static uint8_t   cache_zoom = 0xFF;
+        if (!tile_cache) {
+          #ifdef ESP_PLATFORM
+            tile_cache = (uint16_t*)heap_caps_malloc(
+                TDECK_TILE_SIZE * TDECK_TILE_SIZE * sizeof(uint16_t),
+                MALLOC_CAP_SPIRAM);
+          #endif
+            if (!tile_cache) tile_cache = (uint16_t*)malloc(
+                TDECK_TILE_SIZE * TDECK_TILE_SIZE * sizeof(uint16_t));
+        }
+
+        for (int64_t ty = t0y; ty <= t1y; ty++) {
+            for (int64_t tx = t0x; tx <= t1x; tx++) {
+                int16_t sx = (int16_t)(tx * TDECK_TILE_SIZE - (int64_t)vp_x);
+                int16_t sy = (int16_t)(ty * TDECK_TILE_SIZE - (int64_t)vp_y);
+                if (sx + TDECK_TILE_SIZE <= 0 || sx >= TDECK_SAR_MAP_W) continue;
+                if (sy + TDECK_TILE_SIZE <= 0 || sy >= TDECK_SAR_MAP_H) continue;
+
+                // Load (cache-miss only).
+                if (cache_zoom != tdeck_sar_zoom || cache_tx != tx || cache_ty != ty) {
+                    cache_zoom = tdeck_sar_zoom;
+                    cache_tx = tx;
+                    cache_ty = ty;
+                    if (tdeck_sar_load_tile_png(tx, ty, tdeck_sar_zoom, tile_cache)) {
+                        // draw only the visible portion
+                        int16_t clip_x0 = (sx >= 0) ? 0 : -sx;
+                        int16_t clip_y0 = (sy >= 0) ? 0 : -sy;
+                        int16_t clip_x1 = TDECK_TILE_SIZE;
+                        int16_t clip_y1 = TDECK_TILE_SIZE;
+                        if (sx + TDECK_TILE_SIZE > TDECK_SAR_MAP_W)
+                            clip_x1 = TDECK_SAR_MAP_W - sx;
+                        if (sy + TDECK_TILE_SIZE > TDECK_SAR_MAP_H)
+                            clip_y1 = TDECK_SAR_MAP_H - sy;
+                        if (clip_x1 > clip_x0 && clip_y1 > clip_y0) {
+                            for (int16_t yy = clip_y0; yy < clip_y1; yy++) {
+                                for (int16_t xx = clip_x0; xx < clip_x1; xx++) {
+                                    uint16_t px = tile_cache[(uint16_t)yy * TDECK_TILE_SIZE + (uint16_t)xx];
+                                    c.drawPixel(sx + xx, TDECK_SAR_MAP_Y + sy + yy, px);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // No position yet: show a hint.
+        c.setTextSize(1);
+        c.setTextColor(TDECK_COL_WARN);
+        c.setCursor(TDECK_SAR_MAP_X + 8, TDECK_SAR_MAP_Y + TDECK_SAR_MAP_H / 2 - 4);
+        c.print("No position yet - GPS or first beacon");
+    }
+
+    // Draw the local GPS position (blue crosshair) if we have a fix.
+    if (tdeck_gps_present && tdeck_gps_fix && tdeck_sar_has_centre) {
+        double wx, wy;
+        tdeck_sar_latlon_to_world_px(tdeck_gps.latitude(), tdeck_gps.longitude(),
+                                     tdeck_sar_zoom, wx, wy);
+        int16_t sx = (int16_t)(wx - (tdeck_sar_center_lon_e7 / 10000000.0 > 0 ? // unused
+                            0 : 0));  // placeholder to keep compile sane
+        (void)sx;
+        // Compute the same way as the viewport origin: centre world px minus
+        // vp_x. Simpler: re-derive from the viewport world-px top-left.
+        double cx_world, cy_world;
+        tdeck_sar_latlon_to_world_px(tdeck_sar_center_lat_e7 / 10000000.0,
+                                     tdeck_sar_center_lon_e7 / 10000000.0,
+                                     tdeck_sar_zoom, cx_world, cy_world);
+        double vp_x = cx_world - TDECK_SAR_MAP_W / 2.0 + tdeck_sar_pan_px_x;
+        double vp_y = cy_world - TDECK_SAR_MAP_H / 2.0 + tdeck_sar_pan_px_y;
+        int16_t lx = (int16_t)(wx - vp_x);
+        int16_t ly = (int16_t)(wy - vp_y);
+        if (lx >= 0 && lx < TDECK_SAR_MAP_W && ly >= 0 && ly < TDECK_SAR_MAP_H) {
+            c.drawLine(lx - 4, ly, lx + 4, ly, ST77XX_BLUE);
+            c.drawLine(lx, ly - 4, lx, ly + 4, ST77XX_BLUE);
+            c.fillCircle(lx, ly, 2, ST77XX_WHITE);
+        }
+    }
+
+    // Draw peer tracks (green markers, red when stale).
+    for (uint8_t i = 0; i < tdeck_sar_track_count; i++) {
+        tdeck_sar_track_t& tr = tdeck_sar_tracks[i];
+        if (!tdeck_sar_has_centre) break;
+        double wx, wy;
+        tdeck_sar_latlon_to_world_px(tr.lat, tr.lon, tdeck_sar_zoom, wx, wy);
+        double cx_world, cy_world;
+        tdeck_sar_latlon_to_world_px(tdeck_sar_center_lat_e7 / 10000000.0,
+                                     tdeck_sar_center_lon_e7 / 10000000.0,
+                                     tdeck_sar_zoom, cx_world, cy_world);
+        double vp_x = cx_world - TDECK_SAR_MAP_W / 2.0 + tdeck_sar_pan_px_x;
+        double vp_y = cy_world - TDECK_SAR_MAP_H / 2.0 + tdeck_sar_pan_px_y;
+        int16_t lx = (int16_t)(wx - vp_x);
+        int16_t ly = (int16_t)(wy - vp_y);
+        if (lx < -8 || lx >= TDECK_SAR_MAP_W + 8 || ly < -8 || ly >= TDECK_SAR_MAP_H + 8) continue;
+        bool fresh = (millis() - tr.last_heard_ms) < 300000UL;  // 5 min
+        uint16_t col = fresh ? ST77XX_GREEN : TDECK_COL_ERR;
+        c.fillCircle(lx, ly, 4, col);
+        c.drawCircle(lx, ly, 4, TDECK_COL_FG);
+    }
+
+    // Bottom info strip: zoom + peer count.
+    c.setTextSize(1);
+    c.setTextColor(TDECK_COL_DIM);
+    c.setCursor(TDECK_SAR_MAP_X, TDECK_SAR_MAP_Y + TDECK_SAR_MAP_H + 4);
+    c.printf("Z%d  %u peers", (unsigned)tdeck_sar_zoom, (unsigned)tdeck_sar_peer_count);
+    c.setCursor(TDECK_SAR_MAP_X + 100, TDECK_SAR_MAP_Y + TDECK_SAR_MAP_H + 4);
+    if (tdeck_sar_send_enabled) {
+        c.printf("beacon %us", (unsigned)tdeck_sar_interval);
+    } else {
+        c.print("beacon off");
+    }
+}
+
+static void tdeck_ui_draw_sar() {
+    TDeckCanvas &c = tdeck_canvas;
+    if (tdeck_sub == SAR_MAP) {
+        tdeck_ui_draw_sar_map(c);
+        tdeck_ui_draw_footer(c, "TB: pan  W/S: zoom  push: menu");
+    } else if (tdeck_sub == SAR_PEERS) {
+        uint8_t total = tdeck_sar_peer_count + 1;   // "+ Add peer"
+        uint8_t rows = tdeck_ui_list_frame(c, "SAR Peers", total, tdeck_cursor, &tdeck_scroll);
+        for (uint8_t r = 0; r < rows && tdeck_scroll + r < total; r++) {
+            uint8_t idx = tdeck_scroll + r;
+            char line[48];
+            if (idx == 0) {
+                snprintf(line, sizeof(line), "+ Add peer");
+            } else {
+                tdeck_contact_t* cnt = tdeck_contact_find(tdeck_sar_peers[idx - 1]);
+                tdeck_contact_label(cnt, line, sizeof(line));
+            }
+            tdeck_ui_draw_row(c, TDECK_SBAR_H + 30 + r * 16, line, idx == tdeck_cursor);
+        }
+        tdeck_ui_draw_footer(c, "select: add/remove  L: back");
+    } else if (tdeck_sub == SAR_PICK) {
+        // Contact picker: choose a contact to add as a beacon peer.
+        uint8_t total = tdeck_contact_count;
+        uint8_t rows = tdeck_ui_list_frame(c, "Add peer", total,
+                                           tdeck_sar_pick_contact_cursor,
+                                           &tdeck_sar_pick_contact_scroll);
+        for (uint8_t r = 0; r < rows && tdeck_sar_pick_contact_scroll + r < total; r++) {
+            uint8_t idx = tdeck_sar_pick_contact_scroll + r;
+            char line[48];
+            tdeck_contact_label(&tdeck_contacts[idx], line, sizeof(line));
+            if (tdeck_sar_peer_index(tdeck_contacts[idx].hash) >= 0) {
+                snprintf(line + strlen(line), sizeof(line) - strlen(line), " [added]");
+            }
+            tdeck_ui_draw_row(c, TDECK_SBAR_H + 30 + r * 16, line,
+                              idx == tdeck_sar_pick_contact_cursor);
+        }
+        if (total == 0) {
+            c.setTextSize(1);
+            c.setTextColor(TDECK_COL_WARN);
+            c.setCursor(TDECK_LIST_X, TDECK_SBAR_H + 60);
+            c.print("No contacts - wait for announces");
+        }
+        tdeck_ui_draw_footer(c, "select: add peer  L: back");
+    } else if (tdeck_sub == SAR_CFG) {
+        static const char* items[] = { "Beacon interval", "Send beacons",
+                                       "Map zoom", "Recentre here" };
+        uint8_t n = 4;
+        uint8_t rows = tdeck_ui_list_frame(c, "SAR Config", n, tdeck_cursor, &tdeck_scroll);
+        for (uint8_t r = 0; r < rows && tdeck_scroll + r < n; r++) {
+            uint8_t idx = tdeck_scroll + r;
+            char line[56];
+            if (idx == 0)      snprintf(line, sizeof(line), "Beacon interval: %us", (unsigned)tdeck_sar_interval);
+            else if (idx == 1) snprintf(line, sizeof(line), "Send beacons: %s", tdeck_sar_send_enabled ? "on" : "off");
+            else if (idx == 2) snprintf(line, sizeof(line), "Map zoom: %u", (unsigned)tdeck_sar_zoom);
+            else               snprintf(line, sizeof(line), "Recentre here");
+            tdeck_ui_draw_row(c, TDECK_SBAR_H + 30 + r * 16, line, idx == tdeck_cursor);
+        }
+        tdeck_ui_draw_footer(c, "select: change  L: back");
+    } else if (tdeck_sub == SAR_CFG_EDIT) {
+        // Value editor for the selected config row (uses the existing
+        // SET_EDIT-style layout). Row selectors map to 20/21/22 so the
+        // shared tdeck_set_edit_change() SAR cases are reached without
+        // colliding with the Settings app row indices 0-11.
+        char label[32], value[40];
+        bool action = false;
+        switch (tdeck_set_edit_idx) {
+            case 20: snprintf(label, sizeof(label), "Beacon interval"); snprintf(value, sizeof(value), "%us", (unsigned)tdeck_sar_interval); break;
+            case 21: snprintf(label, sizeof(label), "Send beacons"); snprintf(value, sizeof(value), "%s", tdeck_sar_send_enabled ? "on" : "off"); break;
+            case 22: snprintf(label, sizeof(label), "Map zoom"); snprintf(value, sizeof(value), "%u", (unsigned)tdeck_sar_zoom); break;
+            default: snprintf(label, sizeof(label), ""); value[0] = '\0'; break;
+        }
+        (void)action;
+        c.setTextSize(2);
+        c.setTextColor(TDECK_COL_ACCENT);
+        c.setCursor(TDECK_LIST_X, TDECK_SBAR_H + 8);
+        c.print(label);
+        c.drawFastHLine(0, TDECK_SBAR_H + 32, TDECK_SCREEN_W, TDECK_COL_DIM);
+        c.setTextSize(2);
+        c.setTextColor(TDECK_COL_FG);
+        c.setCursor(20, TDECK_SBAR_H + 60);
+        c.print(value);
+        c.setTextSize(1);
+        c.setTextColor(TDECK_COL_DIM);
+        c.setCursor(TDECK_LIST_X, TDECK_SBAR_H + 100);
+        c.print("UP/DOWN: change   Enter: save   L: back");
+        tdeck_ui_draw_footer(c, "SAR config");
+    }
+}
+
 // ---- Drawing helpers ---------------------------------------------------------
 
 // Small satellite glyph for the GPS status indicator. The whole icon (antenna
@@ -1789,26 +2509,28 @@ static uint8_t tdeck_ui_list_frame(TDeckCanvas& c, const char* title, uint8_t n,
 
 static void tdeck_ui_draw_home() {
     TDeckCanvas &c = tdeck_canvas;
+    // Compact 5-app grid: title/rule raised and rows tightened so every app
+    // (including the 5th, SAR) fits between the status bar and the footer.
     c.setTextSize(2);
     c.setTextColor(TDECK_COL_ACCENT);
-    c.setCursor(10, TDECK_SBAR_H + 8);
+    c.setCursor(10, TDECK_SBAR_H + 6);
     c.print("microReticulum");
-    c.drawFastHLine(0, TDECK_SBAR_H + 32, TDECK_SCREEN_W, TDECK_COL_DIM);
+    c.drawFastHLine(0, TDECK_SBAR_H + 28, TDECK_SCREEN_W, TDECK_COL_DIM);
 
-    static const char* apps[] = { "Messages", "Contacts", "Reticulum", "Settings" };
-    uint8_t napps = 4;
+    static const char* apps[] = { "Messages", "Contacts", "Reticulum", "Settings", "SAR" };
+    uint8_t napps = 5;
     for (uint8_t i = 0; i < napps; i++) {
-        uint8_t y = TDECK_SBAR_H + 44 + i * 40;
+        uint8_t y = TDECK_SBAR_H + 36 + i * 32;
         bool sel = (i == tdeck_cursor);
-        if (sel) c.fillRect(0, y - 2, TDECK_SCREEN_W, 34, TDECK_COL_SEL);
-        tdeck_ui_draw_icon(c, 14, y + 6, i, sel ? ST77XX_WHITE : TDECK_COL_ACCENT);
+        if (sel) c.fillRect(0, y - 1, TDECK_SCREEN_W, 30, TDECK_COL_SEL);
+        tdeck_ui_draw_icon(c, 14, y + 5, i, sel ? ST77XX_WHITE : TDECK_COL_ACCENT);
         c.setTextSize(2);
         c.setTextColor(sel ? ST77XX_WHITE : TDECK_COL_FG);
-        c.setCursor(40, y + 7);
+        c.setCursor(40, y + 5);
         c.print(apps[i]);
     }
 
-    tdeck_ui_draw_footer(c, "TB: scroll/select  L: back  long press: home");
+    tdeck_ui_draw_footer(c, "WASD/TB: nav  Enter: select  Bksp: back");
 }
 
 // Number of distinct peers that have messages (conversations).
@@ -1975,7 +2697,7 @@ static void tdeck_ui_draw_text_input(const char* title, const char* buf) {
     c.setTextSize(1);
     c.setTextColor(TDECK_COL_DIM);
     c.setCursor(TDECK_LIST_X, TDECK_SBAR_H + 104);
-    c.print("Enter: ok   Backspace: delete   Esc: cancel");
+    c.print("Enter: ok   Backspace: delete   L: back");
     tdeck_ui_draw_footer(c, "type on keyboard  L: back");
 }
 
@@ -2416,6 +3138,7 @@ static void tdeck_ui_draw() {
             }
             break;
         case SCREEN_SETTINGS:  tdeck_ui_draw_settings(); break;
+        case SCREEN_SAR:       tdeck_ui_draw_sar(); break;
         default:               tdeck_ui_draw_home(); break;
     }
     display.drawRGBBitmap(0, 0, tdeck_canvas.buf(), TDECK_SCREEN_W, TDECK_SCREEN_H);
@@ -2538,6 +3261,23 @@ static void tdeck_set_edit_change(int dir) {
             tdeck_settings_dirty = true;
             break;
         }
+        // SAR config rows (reuse tdeck_set_edit_idx while in the SAR app)
+        case 20: {  // SAR beacon interval: +/- 5 s
+            int v = (int)tdeck_sar_interval + dir * 5;
+            tdeck_sar_interval = (uint16_t)constrain(v, 10, 3600);
+            tdeck_settings_dirty = true;
+            break;
+        }
+        case 21: {  // SAR send toggle
+            tdeck_sar_send_enabled = !tdeck_sar_send_enabled;
+            tdeck_settings_dirty = true;
+            break;
+        }
+        case 22: {  // SAR map zoom
+            int v = (int)tdeck_sar_zoom + dir;
+            tdeck_sar_zoom = (uint8_t)constrain(v, TDECK_SAR_MIN_ZOOM, TDECK_SAR_MAX_ZOOM);
+            break;
+        }
         default: break;
     }
     tdeck_dirty = true;
@@ -2546,14 +3286,88 @@ static void tdeck_set_edit_change(int dir) {
 static void tdeck_ui_nav_select() {
     switch (tdeck_screen) {
       case SCREEN_HOME:
-        if (tdeck_cursor < 4) {
-            static const uint8_t targets[4][2] = {
+        if (tdeck_cursor < 5) {
+            static const uint8_t targets[5][2] = {
                 { SCREEN_MESSAGES, MSG_INBOX },
                 { SCREEN_CONTACTS, CT_LIST },
                 { SCREEN_RETICULUM, RET_MENU },
                 { SCREEN_SETTINGS, SET_LIST },
+                { SCREEN_SAR, SAR_MAP },
             };
             tdeck_ui_nav_push(targets[tdeck_cursor][0], targets[tdeck_cursor][1]);
+        }
+        break;
+
+      case SCREEN_SAR:
+        if (tdeck_sub == SAR_MAP) {
+            // Enter the SAR menu (peers/config)
+            tdeck_ui_nav_push(SCREEN_SAR, SAR_PEERS);
+        } else if (tdeck_sub == SAR_PEERS) {
+            if (tdeck_cursor == 0) {
+                // Open contact picker (curated list of contacts)
+                if (tdeck_contact_count == 0) {
+                    tdeck_toast_set("No contacts - wait for announces");
+                } else {
+                    tdeck_sar_pick_contact_cursor = 0;
+                    tdeck_sar_pick_contact_scroll = 0;
+                    tdeck_ui_nav_push(SCREEN_SAR, SAR_PICK);
+                }
+            } else if (tdeck_cursor - 1 < tdeck_sar_peer_count) {
+                // Remove the selected peer
+                uint8_t idx = tdeck_cursor - 1;
+                memmove(&tdeck_sar_peers[idx], &tdeck_sar_peers[idx + 1],
+                        sizeof(tdeck_sar_peers[0]) * (tdeck_sar_peer_count - idx - 1));
+                tdeck_sar_peer_count--;
+                tdeck_settings_dirty = true;
+                tdeck_toast_set("Peer removed");
+            }
+        } else if (tdeck_sub == SAR_PICK) {
+            if (tdeck_sar_pick_contact_cursor < tdeck_contact_count) {
+                tdeck_contact_t* c = &tdeck_contacts[tdeck_sar_pick_contact_cursor];
+                if (tdeck_sar_peer_index(c->hash) >= 0) {
+                    tdeck_toast_set("Peer already added");
+                } else if (tdeck_sar_peer_count >= TDECK_SAR_MAX_PEERS) {
+                    tdeck_toast_set("Max %u peers", TDECK_SAR_MAX_PEERS);
+                } else {
+                    strncpy(tdeck_sar_peers[tdeck_sar_peer_count], c->hash,
+                            sizeof(tdeck_sar_peers[0]) - 1);
+                    tdeck_sar_peers[tdeck_sar_peer_count][sizeof(tdeck_sar_peers[0]) - 1] = '\0';
+                    tdeck_sar_peer_count++;
+                    tdeck_settings_dirty = true;
+                    tdeck_toast_set("Peer added");
+                    tdeck_ui_nav_back();
+                }
+            }
+        } else if (tdeck_sub == SAR_CFG) {
+            switch (tdeck_cursor) {
+                case 0: // beacon interval
+                    tdeck_set_edit_idx = 20;
+                    tdeck_ui_nav_push(SCREEN_SAR, SAR_CFG_EDIT);
+                    break;
+                case 1: // send toggle
+                    tdeck_set_edit_idx = 21;
+                    tdeck_ui_nav_push(SCREEN_SAR, SAR_CFG_EDIT);
+                    break;
+                case 2: // zoom
+                    tdeck_set_edit_idx = 22;
+                    tdeck_ui_nav_push(SCREEN_SAR, SAR_CFG_EDIT);
+                    break;
+                case 3: // recentre
+                    if (tdeck_gps_present && tdeck_gps_fix) {
+                        tdeck_sar_center_lat_e7 = (int64_t)(tdeck_gps.latitude() * 10000000.0);
+                        tdeck_sar_center_lon_e7 = (int64_t)(tdeck_gps.longitude() * 10000000.0);
+                        tdeck_sar_pan_px_x = 0;
+                        tdeck_sar_pan_px_y = 0;
+                        tdeck_sar_has_centre = true;
+                        tdeck_toast_set("Centred");
+                    } else {
+                        tdeck_toast_set("No GPS fix");
+                    }
+                    break;
+            }
+        } else if (tdeck_sub == SAR_CFG_EDIT) {
+            tdeck_settings_dirty = true;
+            tdeck_ui_nav_back();
         }
         break;
 
@@ -2778,7 +3592,7 @@ static void tdeck_ui_nav_select() {
 static void tdeck_ui_nav_up() {
     switch (tdeck_screen) {
       case SCREEN_HOME:
-        tdeck_cursor = (tdeck_cursor + 3) % 4;      // wrap around 4 apps
+        tdeck_cursor = (tdeck_cursor + 4) % 5;      // wrap around 5 apps
         break;
       case SCREEN_MESSAGES:
         if (tdeck_sub == MSG_INBOX) {
@@ -2808,6 +3622,19 @@ static void tdeck_ui_nav_up() {
             tdeck_set_edit_change(+1);
         }
         break;
+      case SCREEN_SAR:
+        if (tdeck_sub == SAR_MAP) {
+            // Trackball up/down = pan the map up/down
+            tdeck_sar_pan_px_y -= 24;
+            tdeck_dirty = true;
+        } else if (tdeck_sub == SAR_PEERS) {
+            if (tdeck_cursor > 0) tdeck_cursor--;
+        } else if (tdeck_sub == SAR_CFG) {
+            if (tdeck_cursor > 0) tdeck_cursor--;
+        } else if (tdeck_sub == SAR_CFG_EDIT) {
+            tdeck_set_edit_change(+1);
+        }
+        break;
       default: break;
     }
     tdeck_dirty = true;
@@ -2816,7 +3643,7 @@ static void tdeck_ui_nav_up() {
 static void tdeck_ui_nav_down() {
     switch (tdeck_screen) {
       case SCREEN_HOME:
-        tdeck_cursor = (tdeck_cursor + 1) % 4;
+        tdeck_cursor = (tdeck_cursor + 1) % 5;
         break;
       case SCREEN_MESSAGES:
         if (tdeck_sub == MSG_INBOX) {
@@ -2856,38 +3683,105 @@ static void tdeck_ui_nav_down() {
             tdeck_set_edit_change(-1);
         }
         break;
+      case SCREEN_SAR:
+        if (tdeck_sub == SAR_MAP) {
+            // Trackball down = pan the map down
+            tdeck_sar_pan_px_y += 24;
+            tdeck_dirty = true;
+        } else if (tdeck_sub == SAR_PEERS) {
+            uint8_t total = tdeck_sar_peer_count + 1;
+            if (tdeck_cursor + 1 < total) tdeck_cursor++;
+        } else if (tdeck_sub == SAR_PICK) {
+            if (tdeck_sar_pick_contact_cursor + 1 < tdeck_contact_count)
+                tdeck_sar_pick_contact_cursor++;
+        } else if (tdeck_sub == SAR_CFG) {
+            if (tdeck_cursor + 1 < 4) tdeck_cursor++;
+        } else if (tdeck_sub == SAR_CFG_EDIT) {
+            tdeck_set_edit_change(-1);
+        }
+        break;
       default: break;
     }
     tdeck_dirty = true;
 }
 
 // ---- Input handling ------------------------------------------------------------
+//
+// Navigation input map:
+//   back           = Backspace key, trackball-left
+//   enter          = Enter key, trackball push
+//   scroll up      = W key, trackball up
+//   scroll down    = S key, trackball down
+//   scroll left    = A key, trackball left
+//   scroll right   = D key, trackball right
+//
+// Key-based navigation never exits a text field. In a text field the W/A/S/D
+// keys type their letters, Backspace deletes, and Enter applies; only the
+// trackball-left "back" event leaves text input without applying.
 
 static void tdeck_ui_handle_key(char key, uint8_t state) {
     // Only act on press events; ignore release/auto-repeat noise.
     if (state != KB_KEY_STATE_PRESS && state != KB_KEY_STATE_LONG_PRESS) return;
 
+    // In a text field every printable key (including W/A/S/D) types a
+    // character. Backspace deletes without leaving the field; Enter applies.
+    // Key-based navigation never exits text input - only the trackball-left
+    // event leaves a text field.
+    if (tdeck_in_text_input()) {
+        switch (key) {
+            case 0x0A:   // LF / Enter: apply the text
+            case 0x0D:   // CR / Enter: apply the text
+                tdeck_input_apply();
+                break;
+            case 0x08:   // Backspace: delete character (does not exit)
+                tdeck_input_del();
+                break;
+            default:
+                if (key >= 0x20 && key <= 0x7E) {
+                    tdeck_input_add(key);
+                }
+                break;
+        }
+        tdeck_dirty = true;
+        return;
+    }
+
+    // Navigation mapping (outside text input).
     switch (key) {
-        case 0x0A:   // LF / Enter
-        case 0x0D:   // CR / Enter
-            if (tdeck_in_text_input()) tdeck_input_apply();
-            else tdeck_ui_nav_select();
+        case 0x0A:   // LF / Enter -> enter
+        case 0x0D:   // CR / Enter -> enter
+            tdeck_ui_nav_select();
             break;
-        case 0x08:   // Backspace
-            if (tdeck_in_text_input()) tdeck_input_del();
-            else tdeck_ui_nav_back();
-            break;
-        case 0x1B:   // Esc
+        case 0x08:   // Backspace -> back
             tdeck_ui_nav_back();
             break;
+        case 'w': case 'W':   // scroll up (SAR map: zoom in)
+            if (tdeck_screen == SCREEN_SAR && tdeck_sub == SAR_MAP) {
+                if (tdeck_sar_zoom < TDECK_SAR_MAX_ZOOM) tdeck_sar_zoom++;
+                tdeck_dirty = true;
+            } else {
+                tdeck_ui_nav_up();
+            }
+            break;
+        case 's': case 'S':   // scroll down (SAR map: zoom out)
+            if (tdeck_screen == SCREEN_SAR && tdeck_sub == SAR_MAP) {
+                if (tdeck_sar_zoom > TDECK_SAR_MIN_ZOOM) tdeck_sar_zoom--;
+                tdeck_dirty = true;
+            } else {
+                tdeck_ui_nav_down();
+            }
+            break;
+        case 'a': case 'A':   // scroll left -> back
+            tdeck_ui_nav_back();
+            break;
+        case 'd': case 'D':   // scroll right -> select
+            tdeck_ui_nav_select();
+            break;
         default:
-            if (key >= 0x20 && key <= 0x7E) {
-                if (tdeck_in_text_input()) {
-                    tdeck_input_add(key);
-                } else if (tdeck_screen == SCREEN_HOME && key >= '1' && key <= '4') {
-                    tdeck_cursor = (uint8_t)(key - '1');
-                    tdeck_ui_nav_select();
-                }
+            // Home-screen app shortcuts (1-5) remain available.
+            if (tdeck_screen == SCREEN_HOME && key >= '1' && key <= '5') {
+                tdeck_cursor = (uint8_t)(key - '1');
+                tdeck_ui_nav_select();
             }
             break;
     }
@@ -2895,13 +3789,34 @@ static void tdeck_ui_handle_key(char key, uint8_t state) {
 }
 
 static void tdeck_ui_handle_trackball(tb_event_t event) {
+    // On the SAR map view the trackball's primary purpose is panning the
+    // map: all four directions move the viewport, and press still acts as
+    // Enter (opens the SAR menu). Leave the map with the Backspace key.
+    if (tdeck_screen == SCREEN_SAR && tdeck_sub == SAR_MAP) {
+        switch (event) {
+            case TB_EVENT_UP:         tdeck_sar_pan_px_y -= 24; break;
+            case TB_EVENT_DOWN:       tdeck_sar_pan_px_y += 24; break;
+            case TB_EVENT_LEFT:       tdeck_sar_pan_px_x -= 24; break;
+            case TB_EVENT_RIGHT:      tdeck_sar_pan_px_x += 24; break;
+            case TB_EVENT_PRESS:      tdeck_ui_nav_select(); break;
+            case TB_EVENT_PRESS_LONG: tdeck_ui_go_home(); break;
+            default: break;
+        }
+        tdeck_dirty = true;
+        return;
+    }
+
+    // In a text field, scroll events (up/down/right) and long-press-home do
+    // not navigate; only trackball-left exits the field and trackball-push
+    // acts as Enter (applies the text).
+    bool in_text = tdeck_in_text_input();
     switch (event) {
-        case TB_EVENT_UP:         tdeck_ui_nav_up(); break;
-        case TB_EVENT_DOWN:       tdeck_ui_nav_down(); break;
-        case TB_EVENT_LEFT:       tdeck_ui_nav_back(); break;
-        case TB_EVENT_RIGHT:      tdeck_ui_nav_select(); break;
-        case TB_EVENT_PRESS:      tdeck_ui_nav_select(); break;
-        case TB_EVENT_PRESS_LONG: tdeck_ui_go_home(); break;
+        case TB_EVENT_UP:         if (!in_text) tdeck_ui_nav_up(); break;
+        case TB_EVENT_DOWN:       if (!in_text) tdeck_ui_nav_down(); break;
+        case TB_EVENT_LEFT:       tdeck_ui_nav_back(); break;   // back / exit text field
+        case TB_EVENT_RIGHT:      if (!in_text) tdeck_ui_nav_select(); break;
+        case TB_EVENT_PRESS:      tdeck_ui_nav_select(); break; // enter / apply text
+        case TB_EVENT_PRESS_LONG: if (!in_text) tdeck_ui_go_home(); break;
         default: break;
     }
     tdeck_dirty = true;
@@ -3157,6 +4072,15 @@ void tdeck_ui_loop() {
             tdeck_last_rx_count = rx;
             tdeck_last_rx_ms = millis();
         }
+    }
+
+    // SAR beacon pacing: send the current fix to all configured peers at the
+    // configured interval (millis-based so it works before GPS-disciplined
+    // time). Also expire stale peer tracks.
+    tdeck_sar_expire_tracks();
+    if (tdeck_sar_interval > 0 &&
+        (millis() - tdeck_sar_last_beacon_ms >= (uint32_t)tdeck_sar_interval * 1000)) {
+        tdeck_rns_sar_beacon();
     }
   #endif
 
