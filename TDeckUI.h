@@ -10,10 +10,13 @@
 // The UI is organised around a home screen (app launcher) with a top status
 // bar that is ALWAYS visible on every screen:
 //
-//   * time (RNS system clock, or uptime when no real-time clock is present)
-//   * GPS status indicator (no GPS is fitted to the T-Deck, but the
-//     indicator is driven by software state so future GPS support plugs
-//     straight in via tdeck_ui_set_gps_fix())
+//   * time (RNS system clock, GPS-disciplined when a fix is held, otherwise
+//     uptime when no real-time clock is present)
+//   * GPS status indicator ("n/a" = no receiver, "--" = acquiring,
+//     "3D" = fix held) — an L76K or other NMEA-0183 GNSS on UART1
+//     (GPIO 43/44) is parsed by TDeckGPS.h; the fix is published to peers
+//     through the LXMF announce payload and, once its UTC epoch reaches RNS,
+//     drives the status bar clock.
 //   * Reticulum status (transport on/off, radio state, peer count)
 //   * battery percentage
 //
@@ -58,6 +61,10 @@
 // (RNode_Firmware.ino), so the symbols are defined exactly once.
 #define TDECK_TRACKBALL_IMPLEMENTATION
 #include "TDeckTrackball.h"
+// The GPS driver implementation (global singleton) is likewise defined
+// exactly once here.
+#define TDECK_GPS_IMPLEMENTATION
+#include "TDeckGPS.h"
 #include "LXMF.h"
 
 // The T-Deck's ST7789 panel is mounted in landscape; the drawing surface is
@@ -201,6 +208,11 @@ typedef struct {
   bool  has_key;
   bool  persisted;             // present in settings.yaml
   double last_seen;            // unix time of last announce
+  float lat;                   // last announced position (0 = unknown)
+  float lon;
+  float alt;
+  uint8_t sat;
+  float age_s;
 } tdeck_contact_t;
 
 static tdeck_contact_t tdeck_contacts[TDECK_MAX_CONTACTS];
@@ -221,6 +233,7 @@ static char     tdeck_set_device_name[64]    = "microReticulum Node";
 static uint8_t  tdeck_set_brightness         = 128;
 static uint16_t tdeck_set_blank_timeout      = 30;   // seconds; 0 = never
 static bool     tdeck_set_gps_enabled        = true;
+static int16_t  tdeck_set_tz_offset_min      = 0;    // minutes from UTC (e.g. -480 EST)
 static uint16_t tdeck_set_announce_interval  = 0;    // minutes; 0 = off
 static bool     tdeck_set_confirm_send       = false;
 static bool     tdeck_settings_dirty         = false;
@@ -235,8 +248,10 @@ static const uint32_t tdeck_bw_options[] = {
 static bool     tdeck_ui_ready       = false;
 static bool     tdeck_dirty          = true;
 static bool     tdeck_sd_ready       = false;
-static bool     tdeck_gps_fix        = false;  // updated via tdeck_ui_set_gps_fix()
-static bool     tdeck_gps_present    = false;  // T-Deck has no GPS fitted
+static bool     tdeck_gps_fix        = false;  // updated from tdeck_gps in the loop
+static bool     tdeck_gps_present    = false;  // set when a GNSS is detected on UART1
+static bool     tdeck_gps_time_set   = false;  // GNSS UTC epoch applied to RNS clock
+static bool     tdeck_gps_announced  = false;  // first-fix announce already sent
 static uint32_t tdeck_last_tick      = 0;
 static uint32_t tdeck_tick_ms        = 1000;
 
@@ -759,6 +774,8 @@ static bool tdeck_settings_load() {
                 tdeck_set_blank_timeout = (uint16_t)constrain(atoi(vs), 0, 3600);
             } else if (k == "gps_enabled") {
                 tdeck_set_gps_enabled = (v == "true");
+            } else if (k == "timezone_offset") {
+                tdeck_set_tz_offset_min = (int16_t)constrain(atoi(vs), -1440, 1440);
             } else if (k == "announce_interval") {
                 tdeck_set_announce_interval = (uint16_t)constrain(atoi(vs), 0, 1440);
             } else if (k == "confirm_send") {
@@ -823,6 +840,7 @@ static bool tdeck_settings_save() {
     f.printf("brightness: %u\n", tdeck_set_brightness);
     f.printf("blank_timeout: %u\n", tdeck_set_blank_timeout);
     f.printf("gps_enabled: %s\n", tdeck_set_gps_enabled ? "true" : "false");
+    f.printf("timezone_offset: %d\n", tdeck_set_tz_offset_min);
     f.printf("announce_interval: %u\n", tdeck_set_announce_interval);
     f.printf("confirm_send: %s\n", tdeck_set_confirm_send ? "true" : "false");
     f.printf("radio_freq: %u\n", lora_freq);
@@ -903,6 +921,54 @@ static const char* tdeck_rns_field(const char* start, uint8_t idx, char* out, si
     return end ? end + 1 : NULL;
 }
 
+// Decode the optional location element appended by other T-Deck UIs to
+// their LXMF announce app_data:
+//   [display_name, stamp_cost, [supported_features], [lat, lon, alt_m, sat, age_s]]
+// The location element is a msgpack fixarray5 of 3 floats, a positive int
+// (satellites), and a float (age seconds). Returns true and fills the outputs
+// when a well-formed location element is found.
+static bool tdeck_announce_location(const uint8_t* data, size_t size,
+                                    float& lat, float& lon, float& alt,
+                                    uint8_t& sat, float& age_s) {
+    if (!data || size < 3) return false;
+    LXMF::MsgPackReader reader(data, size);
+
+    size_t count = 0;
+    if (!reader.read_array_header(count) || count < 5) return false;
+
+    // Element 0: display name (bin/str) — skip.
+    std::vector<uint8_t> name;
+    if (!reader.read_bin(name)) return false;
+
+    // Element 1: stamp_cost (nil) — skip.
+    if (!reader.skip_object()) return false;
+
+    // Element 2: [supported_functionality] — skip.
+    if (!reader.skip_object()) return false;
+
+    // Element 3: [lat, lon, alt_m, sat, age_s].
+    size_t loc_count = 0;
+    if (!reader.read_array_header(loc_count) || loc_count < 5) return false;
+
+    double lat_d = 0, lon_d = 0, alt_d = 0, age_d = 0;
+    if (!reader.read_double(lat_d) || !reader.read_double(lon_d) ||
+        !reader.read_double(alt_d)) return false;
+
+    // Satellites: MsgPackReader.read_int handles both fixint and int8/16/32.
+    int64_t sat_i = 0;
+    if (!reader.read_int(sat_i)) return false;
+    if (sat_i < 0 || sat_i > 255) return false;
+
+    if (!reader.read_double(age_d)) return false;
+
+    lat = (float)lat_d;
+    lon = (float)lon_d;
+    alt = (float)alt_d;
+    sat = (uint8_t)sat_i;
+    age_s = (float)age_d;
+    return true;
+}
+
 // Fired by the Transport for every announce heard on the mesh. Populates the
 // contact store with the announced identity (hash + public key + name).
 //
@@ -932,6 +998,12 @@ static void tdeck_rns_on_announce(const RNS::Bytes& dst_hash, const RNS::Identit
         // destination hash (what Sideband shows as the peer address).
         strncpy(hash, dest, sizeof(hash)-1);
     }
+    // Peer location (if the announce carried our optional 4th element):
+    //   [name, stamp, sf_list, [lat, lon, alt_m, sat, age_s]]
+    float peer_lat = 0.0f, peer_lon = 0.0f, peer_alt = 0.0f, peer_age = 0.0f;
+    uint8_t peer_sat = 0;
+    bool has_loc = false;
+
     if (app_data.size() > 0) {
         // LXMF announces encode the display name as the first element of a
         // msgpack array: [display_name, stamp_cost, [supported_features]].
@@ -952,8 +1024,25 @@ static void tdeck_rns_on_announce(const RNS::Bytes& dst_hash, const RNS::Identit
             std::string ad = app_data.toString();
             strncpy(appd, ad.c_str(), sizeof(appd)-1);
         }
+
+        // Decode the optional 4th announce element (location array).
+        has_loc = tdeck_announce_location(app_data.data(), app_data.size(),
+                                          peer_lat, peer_lon, peer_alt,
+                                          peer_sat, peer_age);
     }
     tdeck_contact_upsert(hash, dest, pub[0] ? pub : NULL, appd, RNS::Utilities::OS::time());
+
+    // Store the decoded position on the contact.
+    if (has_loc) {
+        tdeck_contact_t* c = tdeck_contact_find(hash);
+        if (c) {
+            c->lat  = peer_lat;
+            c->lon  = peer_lon;
+            c->alt  = peer_alt;
+            c->sat  = peer_sat;
+            c->age_s = peer_age;
+        }
+    }
     tdeck_dirty = true;
 }
 
@@ -1260,10 +1349,13 @@ static bool tdeck_rns_send_broadcast(const char* text) {
 // destinations are re-announced here.
 //
 // The LXMF announce app_data is msgpack-encoded as:
-//   [display_name, stamp_cost, [supported_functionality]]
-// matching LXMRouter.get_announce_app_data() in the reference implementation.
-// This makes the T-Deck discoverable by Sideband, NomadNet and all other
-// LXMF clients, which decode the display name from the array.
+//   [display_name, stamp_cost, [supported_functionality], location]
+// matching LXMRouter.get_announce_app_data() in the reference implementation
+// (first three elements). The optional location element is appended only when
+// a fresh GPS fix is held, so standard LXMF clients (Sideband, NomadNet …)
+// still parse the announce unchanged — they read the first three elements and
+// ignore the rest — while other T-Deck UIs decode position from element 3.
+// The location payload is a compact non-fixed array: [lat, lon, alt_m, sat, age_s].
 static void tdeck_rns_announce_ui() {
     if (!tdeck_rns_ready) return;
 
@@ -1279,6 +1371,47 @@ static void tdeck_rns_announce_ui() {
     std::vector<uint8_t> sf_list = {LXMF::SF_COMPRESSION};
     packer.to_array(name, stamp_cost, sf_list);
     RNS::Bytes app_data(packer.data(), packer.size());
+
+    // Append a location element when a fresh fix is held: the final announce
+    // array becomes [name, stamp, sf_list, loc], where loc is the compact
+    // [lat, lon, alt_m, sat, age_s] array. Standard LXMF clients read only
+    // the first three elements and ignore the rest, so interoperability is
+    // preserved while other T-Deck UIs decode position from element 3.
+    // The msgpack fixarray3 header (0x93) produced by to_array() is simply
+    // replaced with a fixarray4 header (0x94) and the loc element bytes are
+    // concatenated — msgpack arrays are flat element lists, so this is the
+    // exact wire representation the reference implementation would emit.
+    if (tdeck_gps_present && tdeck_gps_fix) {
+        float lat = tdeck_gps.latitude();
+        float lon = tdeck_gps.longitude();
+        float alt = tdeck_gps.altitude();
+        uint8_t sat = tdeck_gps.satellites();
+        if (lat != 0.0f || lon != 0.0f) {
+            // age = seconds since the fix was last updated.
+            uint32_t age = (uint32_t)((millis() - tdeck_gps.lastFixMs()) / 1000);
+
+            // location element bytes: fixarray5 [lat, lon, alt, sat, age_s].
+            // Values are cast to double so the MsgPack library emits float64
+            // (packFloat64), which the receiver's MsgPackReader::read_double
+            // decodes — read_double has no float32 branch.
+            arduino::msgpack::Packer loc;
+            loc.reserve_buffer(32);
+            loc.to_array((double)lat, (double)lon, (double)alt,
+                         sat, (double)age);
+
+            std::vector<uint8_t> out;
+            out.reserve(app_data.size() + loc.size() + 1);
+            out.push_back(0x94);                                    // fixarray4
+            // Copy the three base element bytes (skip the 0x93 header).
+            if (app_data.size() > 0) {
+                out.insert(out.end(), app_data.data() + 1, app_data.data() + app_data.size());
+            }
+            // Append the location array element bytes.
+            out.insert(out.end(), loc.data(), loc.data() + loc.size());
+
+            app_data = RNS::Bytes(out.data(), out.size());
+        }
+    }
 
     if (tdeck_rns_msg_dest)  tdeck_rns_msg_dest.announce(app_data);
     if (tdeck_rns_ping_dest) tdeck_rns_ping_dest.announce(app_data);
@@ -1814,6 +1947,16 @@ static void tdeck_ui_draw_contacts() {
             if (ct->has_key)  { c.setCursor(TDECK_LIST_X, y); c.print("Key: yes"); }
             else              { c.setCursor(TDECK_LIST_X, y); c.print("Key: no announce yet"); }
             y += 12;
+            if (ct->lat != 0.0f || ct->lon != 0.0f) {
+                c.setTextColor(TDECK_COL_OK);
+                c.setCursor(TDECK_LIST_X, y);
+                c.printf("Pos: %.4f, %.4f  %uSV", (double)ct->lat, (double)ct->lon, ct->sat);
+                y += 12;
+                c.setTextColor(TDECK_COL_DIM);
+                c.setCursor(TDECK_LIST_X, y);
+                c.printf("Alt: %.0f m  Age: %.0f s", (double)ct->alt, (double)ct->age_s);
+                y += 12;
+            }
         } else {
             c.setTextColor(TDECK_COL_WARN);
             c.setCursor(TDECK_LIST_X, y); c.print("Contact lost"); y += 12;
@@ -2053,23 +2196,33 @@ static void tdeck_ui_draw_reticulum_rest() {
 
 // Settings list: fills `label`/`value` for a given row; `action` marks rows
 // that execute immediately instead of being edited numerically.
-#define TDECK_SET_ROWS 14
+#define TDECK_SET_ROWS 15
 static void tdeck_set_row(uint8_t idx, char* label, size_t n, char* value, size_t vn, bool* action) {
     switch (idx) {
         case 0: snprintf(label, n, "Node name");   snprintf(value, vn, "%s", tdeck_set_device_name); *action = true; break;
         case 1: snprintf(label, n, "Brightness");  snprintf(value, vn, "%u", tdeck_set_brightness);   *action = false; break;
         case 2: snprintf(label, n, "Blank timeout"); snprintf(value, vn, "%us", tdeck_set_blank_timeout); *action = false; break;
         case 3: snprintf(label, n, "Show GPS");    snprintf(value, vn, "%s", tdeck_set_gps_enabled ? "yes" : "no"); *action = false; break;
-        case 4: snprintf(label, n, "Announce min"); snprintf(value, vn, "%u", tdeck_set_announce_interval); *action = false; break;
-        case 5: snprintf(label, n, "Confirm send"); snprintf(value, vn, "%s", tdeck_set_confirm_send ? "yes" : "no"); *action = false; break;
-        case 6: {   // Radio frequency (Hz)
+        case 4: {
+            snprintf(label, n, "Timezone");
+            int h = tdeck_set_tz_offset_min / 60;
+            int m = tdeck_set_tz_offset_min % 60;
+            if (m < 0) m = -m;
+            if (tdeck_set_tz_offset_min == 0) snprintf(value, vn, "UTC");
+            else snprintf(value, vn, "UTC%+d:%02d", h, m);
+            *action = false;
+            break;
+        }
+        case 5: snprintf(label, n, "Announce min"); snprintf(value, vn, "%u", tdeck_set_announce_interval); *action = false; break;
+        case 6: snprintf(label, n, "Confirm send"); snprintf(value, vn, "%s", tdeck_set_confirm_send ? "yes" : "no"); *action = false; break;
+        case 7: {   // Radio frequency (Hz)
             snprintf(label, n, "Radio freq");
             if (lora_freq > 0) snprintf(value, vn, "%u.%03u MHz", lora_freq / 1000000, (lora_freq / 1000) % 1000);
             else snprintf(value, vn, "unset");
             *action = false;
             break;
         }
-        case 7: {   // Radio bandwidth (Hz)
+        case 8: {   // Radio bandwidth (Hz)
             snprintf(label, n, "Radio BW");
             if (lora_bw > 0) {
                 if (lora_bw % 1000 == 0) snprintf(value, vn, "%u kHz", lora_bw / 1000);
@@ -2080,28 +2233,28 @@ static void tdeck_set_row(uint8_t idx, char* label, size_t n, char* value, size_
             *action = false;
             break;
         }
-        case 8: {   // Spreading factor
+        case 9: {   // Spreading factor
             snprintf(label, n, "Radio SF");
             if (lora_sf > 0) snprintf(value, vn, "%d", lora_sf);
             else snprintf(value, vn, "unset");
             *action = false;
             break;
         }
-        case 9: {   // Coding rate (LoRa 4/x, denominator x = 5-8)
+        case 10: {  // Coding rate (LoRa 4/x, denominator x = 5-8)
             snprintf(label, n, "Radio CR");
             snprintf(value, vn, "%d", lora_cr);
             *action = false;
             break;
         }
-        case 10: {  // TX power (dBm)
+        case 11: {  // TX power (dBm)
             snprintf(label, n, "Radio TXP");
             if (lora_txp != 0xFF) snprintf(value, vn, "%d dBm", lora_txp);
             else snprintf(value, vn, "unset");
             *action = false;
             break;
         }
-        case 11: snprintf(label, n, "Save to SD");  snprintf(value, vn, ""); *action = true; break;
-        case 12: snprintf(label, n, "Reload from SD"); snprintf(value, vn, ""); *action = true; break;
+        case 12: snprintf(label, n, "Save to SD");  snprintf(value, vn, ""); *action = true; break;
+        case 13: snprintf(label, n, "Reload from SD"); snprintf(value, vn, ""); *action = true; break;
         default: snprintf(label, n, "Export contacts"); snprintf(value, vn, ""); *action = true; break;
     }
 }
@@ -2226,14 +2379,20 @@ static void tdeck_set_edit_change(int dir) {
             break;
         }
         case 3: tdeck_set_gps_enabled = !tdeck_set_gps_enabled; tdeck_settings_dirty = true; break;
-        case 4: {
+        case 4: {   // Timezone offset: +/- 15 min steps, clamped to ±24 h
+            int v = (int)tdeck_set_tz_offset_min + dir * 15;
+            tdeck_set_tz_offset_min = (int16_t)constrain(v, -1440, 1440);
+            tdeck_settings_dirty = true;
+            break;
+        }
+        case 5: {
             int v = (int)tdeck_set_announce_interval + dir * 5;
             tdeck_set_announce_interval = (uint16_t)constrain(v, 0, 240);
             tdeck_settings_dirty = true;
             break;
         }
-        case 5: tdeck_set_confirm_send = !tdeck_set_confirm_send; tdeck_settings_dirty = true; break;
-        case 6: {   // Radio frequency: +/- 100 kHz
+        case 6: tdeck_set_confirm_send = !tdeck_set_confirm_send; tdeck_settings_dirty = true; break;
+        case 7: {   // Radio frequency: +/- 100 kHz
             long v = (lora_freq > 0) ? (long)lora_freq : 868000000L;
             v += (long)dir * 100000L;
             lora_freq = (uint32_t)constrain(v, 100000000L, 1000000000L);
@@ -2241,7 +2400,7 @@ static void tdeck_set_edit_change(int dir) {
             tdeck_settings_dirty = true;
             break;
         }
-        case 7: {   // Radio bandwidth: cycle through valid SX126x options
+        case 8: {   // Radio bandwidth: cycle through valid SX126x options
             uint8_t best = 0;
             if (lora_bw > 0) {
                 for (uint8_t i = 0; i < TDECK_BW_OPTIONS; i++) {
@@ -2258,7 +2417,7 @@ static void tdeck_set_edit_change(int dir) {
             tdeck_settings_dirty = true;
             break;
         }
-        case 8: {   // Spreading factor: 5-12
+        case 9: {   // Spreading factor: 5-12
             int v = (lora_sf > 0) ? lora_sf : 7;
             v += dir;
             lora_sf = constrain(v, 5, 12);
@@ -2266,7 +2425,7 @@ static void tdeck_set_edit_change(int dir) {
             tdeck_settings_dirty = true;
             break;
         }
-        case 9: {   // Coding rate: 4/5 - 4/8
+        case 10: {  // Coding rate: 4/5 - 4/8
             int v = (lora_cr > 0) ? lora_cr : 5;
             v += dir;
             lora_cr = constrain(v, 5, 8);
@@ -2274,7 +2433,7 @@ static void tdeck_set_edit_change(int dir) {
             tdeck_settings_dirty = true;
             break;
         }
-        case 10: {  // TX power: -9 to 22 dBm
+        case 11: {  // TX power: -9 to 22 dBm
             int v = (lora_txp != 0xFF) ? lora_txp : 17;
             v += dir;
             lora_txp = constrain(v, -9, 22);
@@ -2471,11 +2630,11 @@ static void tdeck_ui_nav_select() {
                     tdeck_input_start(2, tdeck_set_device_name);
                     tdeck_ui_nav_push(SCREEN_RETICULUM, RET_NAME_EDIT);
                     break;
-                case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 10:
+                case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 10: case 11:
                     tdeck_set_edit_idx = tdeck_cursor;
                     tdeck_ui_nav_push(SCREEN_SETTINGS, SET_EDIT);
                     break;
-                case 11:
+                case 12:
                     if (tdeck_settings_save()) {
                         // Radio parameters are also persisted into EEPROM so a
                         // reboot applies them via the normal eeprom_conf_load()
@@ -2491,7 +2650,7 @@ static void tdeck_ui_nav_select() {
                         tdeck_toast_set("SD save failed");
                     }
                     break;
-                case 12:
+                case 13:
                     tdeck_settings_load();
                     tdeck_apply_brightness();
                     // Apply any radio parameters loaded from settings.yaml to
@@ -2505,7 +2664,7 @@ static void tdeck_ui_nav_select() {
                     }
                     tdeck_toast_set("Reloaded");
                     break;
-                case 13:
+                case 14:
                     if (tdeck_contacts_export()) tdeck_toast_set("Exported");
                     else tdeck_toast_set("Export failed");
                     break;
@@ -2718,6 +2877,40 @@ void tdeck_ui_set_gps_fix(bool fix) {
     }
 }
 
+// Called by the UI loop (or externally by GPS code) once a fresh GNSS UTC
+// epoch is available. Installs the epoch into the Reticulum system clock so
+// the status-bar clock, message timestamps and announce timestamps all follow
+// GPS-disciplined real-world time. Returns true the first time it applies.
+bool tdeck_ui_gps_set_time(uint64_t epoch_s) {
+    if (tdeck_gps_time_set) return false;
+    // sanity: Oct 2020 floor, then shift the GNSS UTC epoch by the user's
+    // configured timezone offset so the status-bar clock displays local time
+    // (the UI renders the RNS epoch with gmtime_r, i.e. as UTC).
+    if (epoch_s < 1600000000ULL) return false;   // sanity: Oct 2020 floor
+    int64_t tz_s = (int64_t)tdeck_set_tz_offset_min * 60;
+    if (tz_s > 0) epoch_s += (uint64_t)tz_s;
+    else if (tz_s < 0) epoch_s -= (uint64_t)(-tz_s);
+
+  #ifdef HAS_RNS
+    // RNS::OS::ltime() (Arduino) = millis() + _time_offset. We want
+    // ltime() to equal epoch_s * 1000 at this instant, so the offset =
+    // epoch_ms - millis().
+    uint64_t epoch_ms = epoch_s * 1000ULL;
+    uint64_t now_ms   = (uint64_t)millis();
+    uint64_t offset   = (epoch_ms > now_ms) ? (epoch_ms - now_ms) : 0;
+    RNS::Utilities::OS::setTimeOffset(offset);
+
+    tdeck_gps_time_set = true;
+    tdeck_toast_set("GPS time set");
+    tdeck_dirty = true;
+    tdeck_ui_debug("[TDeck] GPS time applied to RNS clock");
+    return true;
+  #else
+    (void)epoch_s;
+    return false;
+  #endif
+}
+
 void tdeck_ui_init() {
     // Power on the keyboard rail
     pinMode(KB_POWERON, OUTPUT);
@@ -2738,6 +2931,10 @@ void tdeck_ui_init() {
 
     // Start the trackball GPIO interrupts
     tdeck_trackball.begin();
+
+    // Start the GPS/GNSS receiver on UART1 (L76K or compatible NMEA module
+    // on the Gover interface; harmless if no module is fitted).
+    tdeck_gps.begin();
 
     // Allocate the off-screen frame buffer (PSRAM-backed)
     tdeck_canvas.allocate();
@@ -2842,6 +3039,38 @@ void tdeck_ui_loop() {
         }
     }
   #endif
+
+    // Poll the GPS/GNSS UART and keep the status bar + RNS announce in sync.
+    if (tdeck_set_gps_enabled) {
+        tdeck_gps.loop();
+
+        // A module has been detected once any NMEA traffic arrives.
+        if (tdeck_gps.dataSeen() && !tdeck_gps_present) {
+            tdeck_gps_present = true;
+            tdeck_ui_debug("[TDeck] GPS module detected");
+        }
+
+        // Track fix state transitions for the status bar.
+        bool fix = tdeck_gps.hasFix();
+        if (fix != tdeck_gps_fix) tdeck_ui_set_gps_fix(fix);
+
+        // Apply the GNSS UTC epoch to the RNS clock (once).
+        if (tdeck_gps.epochReady() && !tdeck_gps_time_set) {
+            tdeck_ui_gps_set_time(tdeck_gps.gpsEpoch());
+        }
+
+        // On first fix, push an immediate announce so peers learn our
+        // position without waiting for the periodic re-announce.
+      #ifdef HAS_RNS
+        if (tdeck_rns_ready && fix && !tdeck_gps_announced) {
+            tdeck_gps_announced = true;
+            tdeck_rns_announce_ui();
+        }
+      #endif
+    } else {
+        // GPS disabled in settings: drop any stale indication.
+        if (tdeck_gps_present) { tdeck_gps_present = false; tdeck_gps_fix = false; tdeck_dirty = true; }
+    }
 
     // Poll keyboard (the BBQ10/C3 latch key events until read)
     TDeckKeyboard::KeyEvent key_event = tdeck_kb.keyEvent();

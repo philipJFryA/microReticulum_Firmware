@@ -1127,9 +1127,13 @@ printf("[init] op_mode: %U\n", op_mode);
       }
       reticulum.start();
 
-      // Set loop callback only after the Reticulum instance is started
-      // (to avoid looping without a completely initialized instance)
-      RNS::Utilities::OS::set_loop_callback(&loop);
+      // NOTE: The RNS loop callback is intentionally NOT registered.
+      // RNS::Utilities::OS::run_loop() (invoked from Transport::clean_caches()
+      // and clear_storage()) would re-enter the main loop() recursively from
+      // inside reticulum.loop(), which combined with the _jobs_running /
+      // _jobs_locked spin-waits in Transport::inbound()/outbound() deadlocks
+      // the single loop task. The main loop already calls reticulum.loop()
+      // directly, so no callback is needed.
 
       // CBA load/create local destination for admin node
 #if 0
