@@ -356,6 +356,13 @@ static uint8_t tdeck_sar_track_count = 0;
 static uint32_t tdeck_sar_last_beacon_ms = 0;
 static uint32_t tdeck_sar_last_ui_action_ms = 0; // pan/zoom pacing
 
+// SAR debug: last tile path attempted and whether it loaded. Shown on the
+// map view (bottom strip) and logged over serial to help diagnose SD-card
+// layout / tile provisioning issues.
+static char    tdeck_sar_debug_path[80] = "";
+static bool    tdeck_sar_debug_ok       = false;
+static uint8_t tdeck_sar_debug_miss     = 0;   // consecutive cache-miss count
+
 // Inbox scratch for the SAR peer picker (contact indices to choose from).
 static uint8_t tdeck_sar_pick_contact_idx = 0;
 
@@ -1845,6 +1852,44 @@ static void tdeck_sar_world_px_to_latlon(double px, double py, uint8_t zoom,
     lat = lat_rad * (180.0 / PI);
 }
 
+// Decode a 24-bit RGB BMP tile (legacy layout; used as a fallback for SD
+// cards provisioned before the PNG switch). Rows are bottom-up and padded to
+// 4 bytes, each pixel is 3 bytes BGR.
+static bool tdeck_sar_decode_bmp(const char* path, uint16_t* out) {
+    if (!tdeck_sd_ready) return false;
+    File f = SD.open(path, FILE_READ);
+    if (!f) return false;
+
+    // BMP header: 2 (magic) + 12 (DIB header fields we need) ...
+    uint8_t hdr[18];
+    if (f.read(hdr, sizeof(hdr)) != sizeof(hdr)) { f.close(); return false; }
+    if (hdr[0] != 'B' || hdr[1] != 'M') { f.close(); return false; }
+    uint32_t data_offset = (uint32_t)hdr[10] | ((uint32_t)hdr[11] << 8) |
+                           ((uint32_t)hdr[12] << 16) | ((uint32_t)hdr[13] << 24);
+    if (data_offset < sizeof(hdr)) data_offset = sizeof(hdr);
+    f.seek(data_offset);
+
+    const uint16_t pad = (4 - (TDECK_TILE_SIZE * 3) % 4) % 4;
+    uint8_t* row = (uint8_t*)malloc(TDECK_TILE_SIZE * 3 + 3);
+    if (!row) { f.close(); return false; }
+    for (int32_t yy = TDECK_TILE_SIZE - 1; yy >= 0; yy--) {
+        size_t got = f.read(row, TDECK_TILE_SIZE * 3);
+        if (got != TDECK_TILE_SIZE * 3) { free(row); f.close(); return false; }
+        if (pad) f.read(row + TDECK_TILE_SIZE * 3, pad);
+        uint16_t* dst = out + ((int32_t)yy * TDECK_TILE_SIZE);
+        for (uint16_t xx = 0; xx < TDECK_TILE_SIZE; xx++) {
+            uint8_t b = row[xx * 3 + 0];
+            uint8_t g = row[xx * 3 + 1];
+            uint8_t r = row[xx * 3 + 2];
+            uint16_t rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+            dst[xx] = (rgb565 >> 8) | (rgb565 << 8);   // big-endian for GFX
+        }
+    }
+    free(row);
+    f.close();
+    return true;
+}
+
 // Decode a PNG tile (256x256) from the SD card into the given 256x256 RGB565
 // buffer. Returns true on success. The canvas is RGB565 big-endian (Adafruit
 // drawRGBBitmap order), so each pixel is byte-swapped before storing.
@@ -1853,18 +1898,8 @@ static void tdeck_sar_world_px_to_latlon(double px, double py, uint8_t zoom,
 // (tinfl_decompress_mem_to_mem, mapped from the ROM at runtime via
 // esp32s3.rom.ld) - no external PNG library is needed. Standard XYZ tile
 // PNGs (8-bit RGB, RGBA, palette or grayscale) are handled directly.
-static bool tdeck_sar_load_tile_png(int64_t tx, int64_t ty, uint8_t zoom,
-                                    uint16_t* out) {
+static bool tdeck_sar_decode_png(const char* path, uint16_t* out) {
     if (!tdeck_sd_ready) return false;
-    if (zoom < TDECK_SAR_MIN_ZOOM || zoom > TDECK_SAR_MAX_ZOOM) return false;
-    uint32_t n = 1UL << zoom;
-    if (tx < 0 || ty < 0 || tx >= (int64_t)n || ty >= (int64_t)n) return false;
-
-    char path[64];
-    snprintf(path, sizeof(path), "%s/%u/%lld/%lld%s",
-             TDECK_SAR_TILE_ROOT, (unsigned)zoom,
-             (long long)tx, (long long)ty, TDECK_SAR_TILE_EXT);
-    if (!SD.exists(path)) return false;
     File f = SD.open(path, FILE_READ);
     if (!f) return false;
 
@@ -1950,18 +1985,19 @@ static bool tdeck_sar_load_tile_png(int64_t tx, int64_t ty, uint8_t zoom,
 
     if (idat_total == 0) { free(file); free(idat); return false; }
 
-    // ---- zlib header: strip 2-byte header + 4-byte adler32 footer ----
-    if (idat_total < 6) { free(file); free(idat); return false; }
+    // ---- zlib header validation only (tinfl parses it itself) ----
+    if (idat_total < 2) { free(file); free(idat); return false; }
     // Verify the zlib header: CMF & FLG (0x78 0x01/0x5E/0x9C/0xDA)
     if ((idat[0] & 0x0F) != 8 || (idat[0] >> 4) > 7) { free(file); free(idat); return false; }
     if (((idat[0] * 256 + idat[1]) % 31) != 0) { free(file); free(idat); return false; }
-    const uint8_t* inflate_src = idat + 2;
-    uint32_t inflate_len = idat_total - 6;
+    const uint8_t* inflate_src = idat;
+    uint32_t inflate_len = idat_total;
 
     // Raw scanline size (pre-filter) for 8-bit channels.
     uint8_t channels = 1;
-    if (color_type == 2 || color_type == 4) channels = 3;
-    else if (color_type == 6) channels = 4;
+    if (color_type == 2) channels = 3;       // RGB
+    else if (color_type == 4) channels = 2;  // grayscale + alpha
+    else if (color_type == 6) channels = 4;  // RGBA
     uint16_t row_bpp = (uint16_t)(TDECK_TILE_SIZE * channels);
     uint32_t out_bytes = (uint32_t)(row_bpp + 1) * TDECK_TILE_SIZE;
 
@@ -1969,9 +2005,14 @@ static bool tdeck_sar_load_tile_png(int64_t tx, int64_t ty, uint8_t zoom,
     if (!raw) { free(file); free(idat); return false; }
 
   #ifdef ESP_PLATFORM
-    // Use the ROM miniz/tinfl to inflate the raw deflate stream.
+    // Use the ROM miniz/tinfl to inflate the whole zlib stream (header +
+    // deflate + adler32). TINFL_FLAG_PARSE_ZLIB_HEADER makes tinfl parse and
+    // validate the 2-byte zlib header and the 4-byte adler checksum itself,
+    // so we must NOT strip them here - stripping misaligns the deflate
+    // bitstream and produces garbage pixels (rainbow static).
     size_t got = tinfl_decompress_mem_to_mem(raw, out_bytes,
                                              inflate_src, inflate_len,
+                                             TINFL_FLAG_PARSE_ZLIB_HEADER |
                                              TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
     if (got != out_bytes) { free(raw); free(file); free(idat); return false; }
   #else
@@ -2124,7 +2165,40 @@ static void tdeck_ui_draw_sar_map(TDeckCanvas& c) {
                     cache_zoom = tdeck_sar_zoom;
                     cache_tx = tx;
                     cache_ty = ty;
-                    if (tdeck_sar_load_tile_png(tx, ty, tdeck_sar_zoom, tile_cache)) {
+                    // Prefer the primary `.png` tile, fall back to the legacy
+                    // `.bmp` layout for SD cards provisioned before the PNG
+                    // switch (the firmware used to read 24-bit BGR BMPs).
+                    char path[64];
+                    snprintf(path, sizeof(path), "%s/%u/%lld/%lld%s",
+                             TDECK_SAR_TILE_ROOT, (unsigned)tdeck_sar_zoom,
+                             (long long)tx, (long long)ty, ".png");
+                    bool tile_ok = false;
+                    if (SD.exists(path)) {
+                        tile_ok = tdeck_sar_decode_png(path, tile_cache);
+                    }
+                    if (!tile_ok) {
+                        snprintf(path, sizeof(path), "%s/%u/%lld/%lld%s",
+                                 TDECK_SAR_TILE_ROOT, (unsigned)tdeck_sar_zoom,
+                                 (long long)tx, (long long)ty, ".bmp");
+                        if (SD.exists(path)) {
+                            tile_ok = tdeck_sar_decode_bmp(path, tile_cache);
+                        }
+                    }
+                    // Update the on-screen + serial tile-load debug info.
+                    strncpy(tdeck_sar_debug_path, path, sizeof(tdeck_sar_debug_path) - 1);
+                    tdeck_sar_debug_path[sizeof(tdeck_sar_debug_path) - 1] = '\0';
+                    tdeck_sar_debug_ok = tile_ok;
+                    if (!tile_ok) {
+                        tdeck_sar_debug_miss++;
+                        if (tdeck_sar_debug_miss <= 4) {
+                            char dbg[96];
+                            snprintf(dbg, sizeof(dbg), "[SAR] tile missing: %s", path);
+                            tdeck_ui_debug(dbg);
+                        }
+                    } else {
+                        tdeck_sar_debug_miss = 0;
+                    }
+                    if (tile_ok) {
                         // draw only the visible portion
                         int16_t clip_x0 = (sx >= 0) ? 0 : -sx;
                         int16_t clip_y0 = (sy >= 0) ? 0 : -sy;
@@ -2200,7 +2274,7 @@ static void tdeck_ui_draw_sar_map(TDeckCanvas& c) {
         c.drawCircle(lx, ly, 4, TDECK_COL_FG);
     }
 
-    // Bottom info strip: zoom + peer count.
+    // Bottom info strip: zoom + peer count + last tile path debug.
     c.setTextSize(1);
     c.setTextColor(TDECK_COL_DIM);
     c.setCursor(TDECK_SAR_MAP_X, TDECK_SAR_MAP_Y + TDECK_SAR_MAP_H + 4);
@@ -2210,6 +2284,15 @@ static void tdeck_ui_draw_sar_map(TDeckCanvas& c) {
         c.printf("beacon %us", (unsigned)tdeck_sar_interval);
     } else {
         c.print("beacon off");
+    }
+
+    // Debug line: last tile path the renderer tried to load. Coloured red on
+    // a miss, green on a hit, so a broken SD layout is immediately visible.
+    if (tdeck_sar_debug_path[0]) {
+        c.setTextColor(tdeck_sar_debug_ok ? TDECK_COL_OK : TDECK_COL_ERR);
+        c.setCursor(TDECK_SAR_MAP_X, TDECK_SAR_MAP_Y + TDECK_SAR_MAP_H + 14);
+        c.print(tdeck_sar_debug_ok ? "OK: " : "MS: ");
+        c.print(tdeck_sar_debug_path);
     }
 }
 
