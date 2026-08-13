@@ -60,13 +60,6 @@
 #define TDECK_KB_CMD_RAW_MODE    0x03
 #define TDECK_KB_CMD_KEY_MODE    0x04
 
-// Legacy modifier scan codes (key mode only reports printable characters;
-// kept for compatibility with code that maps modifier keys).
-#define KB_MOD_ALT 0x1A
-#define KB_MOD_SHL 0x1B
-#define KB_MOD_SHR 0x1C
-#define KB_MOD_SYM 0x1D
-
 class TDeckKeyboard {
   public:
     typedef struct {
@@ -96,12 +89,6 @@ class TDeckKeyboard {
         _wire->write(BBQ10_REG_RST); // RST register
         _wire->endTransmission();
         delay(100);
-    }
-
-    // The keyboard is polled over I2C; no interrupt pin is used.
-    void attachInterruptPin(uint8_t pin, void (*func)(void)) const {
-        (void)pin;
-        (void)func;
     }
 
     void clearInterruptStatus() {
@@ -134,13 +121,6 @@ class TDeckKeyboard {
         }
     }
 
-    void setDebounce(uint8_t value) {
-        if (_proto == PROTO_BBQ10) {
-            writeRegister(BBQ10_REG_DEB, value); // DEB register
-        }
-    }
-
-    bool present() const { return _proto != PROTO_NONE; }
     uint8_t protocol() const { return _proto; }
 
   private:

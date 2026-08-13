@@ -52,17 +52,16 @@
 #endif
 
 // When this header is included with TDECK_GPS_IMPLEMENTATION (TDeckUI.h
-// does this), driver diagnostics route through the TU-local debug router so
-// GPS logs honour KISS framing exactly like the rest of the UI logs.
+// does this), driver diagnostics route through the UI debug router so GPS
+// logs honour KISS framing exactly like the rest of the UI logs.
 #ifdef TDECK_GPS_IMPLEMENTATION
-  static void tdeck_ui_debug(const char* msg);
+  void tdeck_ui_debug(const char* msg);
 #endif
 
 class TDeckGPS {
   public:
     TDeckGPS() : _has_fix(false), _line_len(0), _satellites(0),
                  _last_fix_ms(0), _lat(0.0f), _lon(0.0f), _alt(0.0f),
-                 _speed_kmh(0.0f), _course(0.0f),
                  _epoch_valid(false), _epoch_s(0), _epoch_fresh_ms(0),
                  _nmea_seen(false), _debug_last_fix(false), _baud(9600),
                  _asleep(false) {}
@@ -160,8 +159,6 @@ class TDeckGPS {
       _open(GPS_BAUD_RATE);
     }
 
-    // Current UART baud used by the active GPS configuration.
-    uint32_t baud() const { return _baud; }
     // -------- low-level helpers --------
 
     // Write a NMEA command to the receiver and consume any echoed bytes so
@@ -233,7 +230,18 @@ class TDeckGPS {
       //    match any revision byte (the official example only accepts
       //    "...02", but other firmware revisions reply 03/04/...).
       Serial1.print("$PCAS06,0*1B\r\n");
-      if (!_await("$GPTXT,01,01,", 2000)) return false;
+      if (!_await("$GPTXT,01,01,", 2000)) {
+        // Re-enable NMEA output before bailing. If the module missed the
+        // version query while still cold-starting / acquiring satellites
+        // (or its boot-time $GPTXT was emitted before _await() began), the
+        // sentence-disabling command sent at the top of this function would
+        // otherwise leave the receiver mute for the rest of the boot — the
+        // driver would never see a GGA/RMC sentence and no fix would ever
+        // be acquired.
+        Serial1.print("$PCAS03,1,1,1,1,1,1,1,1,1,1,,,0,0*02\r\n");
+        delay(250);
+        return false;
+      }
       delay(200);
 
       // 3. GPS + GLONASS constellation.
@@ -383,8 +391,6 @@ class TDeckGPS {
     float latitude() const  { return _lat; }
     float longitude() const { return _lon; }
     float altitude() const  { return _alt; }
-    float speedKmh() const  { return _speed_kmh; }
-    float course() const    { return _course; }
 
     // True once any NMEA traffic has been received since boot — used by the
     // UI to switch the status indicator from "n/a" to "--"/"3D" when an
@@ -412,8 +418,6 @@ class TDeckGPS {
     float    _lat;
     float    _lon;
     float    _alt;
-    float    _speed_kmh;
-    float    _course;
     bool     _epoch_valid;
     uint64_t _epoch_s;
     uint32_t _epoch_fresh_ms;
@@ -586,14 +590,6 @@ class TDeckGPS {
       const char* ew = _field(line, 6, &f_len);
       if (!ew || f_len == 0) return;
       if (ew[0] == 'W') lon = -lon;
-
-      // Field 7: speed in knots → km/h.
-      f = _field(line, 7, &f_len);
-      if (f && f_len > 0) _speed_kmh = (float)(atof(f) * 1.852);
-
-      // Field 8: course over ground (degrees).
-      f = _field(line, 8, &f_len);
-      if (f && f_len > 0) _course = (float)atof(f);
 
       _lat = lat;
       _lon = lon;

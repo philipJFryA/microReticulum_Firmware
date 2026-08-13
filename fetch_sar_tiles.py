@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""Download XYZ (slippy-map) tiles and save them directly as PNG files in the
-exact layout the microReticulum T-Deck SAR app reads:
+"""Download XYZ (slippy-map) tiles from the MapTiler API and save them as
+24-bit BMP files in the exact layout the microReticulum T-Deck SAR app reads:
 
-    /tiles/{zoom}/{x}/{y}.png
+    /tiles/{zoom}/{x}/{y}.bmp
 
-The firmware decodes PNG tiles directly on the ESP32-S3 (using the ROM's
-tinfl/miniz inflate implementation - no PNG library dependency), so the
-original server PNG is written verbatim with no transcoding.
+The firmware decodes 24-bit BMP tiles directly (bottom-up BGR rows padded to 4
+bytes), so each source tile is converted from the MapTiler PNG response to an
+uncompressed 256x256 24-bit BMP.
+
+Requires Pillow for the PNG -> BMP conversion:
+
+    pip install Pillow
 
 Usage:
-  python3 fetch_sar_tiles.py --lat 63.42 --lon 10.39 \
-      --min-zoom 12 --max-zoom 16 [--out ./tiles]
+  python3 fetch_sar_tiles.py --api-key your_key_here \
+      --lat 63.42 --lon 10.39 --min-zoom 12 --max-zoom 16 [--out ./tiles]
 
-  python3 fetch_sar_tiles.py --bbox 63.35,10.25,63.45,10.45 \
-      --min-zoom 12 --max-zoom 16
+  python3 fetch_sar_tiles.py --api-key your_key_here \
+      --bbox 63.35,10.25,63.45,10.45 --min-zoom 12 --max-zoom 16
 
 After it finishes, copy the "tiles" directory to the root of the T-Deck's
 microSD card.
 """
 
 import argparse
+import io
 import math
 import os
 import struct
@@ -27,6 +32,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+try:
+    from PIL import Image
+except ImportError:
+    print("Pillow is required for PNG->BMP conversion. Install with: "
+          "pip install Pillow")
+    sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Web Mercator (EPSG:3857) tile math — same formulas the firmware uses.
@@ -65,23 +77,60 @@ def bbox_tile_range(min_lat: float, min_lon: float,
 
 
 # ---------------------------------------------------------------------------
-# PNG sanity check.
+# BMP writing (24-bit RGB, bottom-up, row padded to 4 bytes — matches the
+# firmware's sar_decode_bmp exactly).
 # ---------------------------------------------------------------------------
 
-def png_is_256x256(data: bytes) -> bool:
-    """Return True if the data is a PNG whose IHDR declares a 256x256 image."""
-    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
-        return False
-    w, h = struct.unpack(">II", data[16:24])
-    return w == 256 and h == 256
+def encode_24bit_bmp(png_bytes: bytes) -> bytes:
+    """Convert PNG bytes to an uncompressed 256x256 24-bit BMP byte string.
+
+    MapTiler renders tiles at 512x512 by default; the firmware's fixed-size
+    decoder requires 256x256, so the image is downscaled with a high-quality
+    resample before encoding.
+    """
+    img = Image.open(io.BytesIO(png_bytes))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    if img.size != (256, 256):
+        img = img.resize((256, 256), Image.LANCZOS)
+
+    w = h = 256
+    row_size = w * 3
+    pad = (4 - row_size % 4) % 4
+    stride = row_size + pad
+    pixel_array_size = stride * h
+
+    bmp = bytearray()
+    # BITMAPFILEHEADER (14 bytes)
+    bmp += b"BM"
+    bmp += struct.pack("<IHHI", 14 + 40 + pixel_array_size, 0, 0, 14 + 40)
+    # BITMAPINFOHEADER (40 bytes)
+    bmp += struct.pack("<IiiHHIIiiII", 40, w, h, 1, 24, 0,
+                       pixel_array_size, 2835, 2835, 0, 0)
+
+    # Pixel rows, bottom-up (BGR order), each row padded to a 4-byte boundary.
+    pixels = img.load()
+    for yy in range(h - 1, -1, -1):   # bottom row first
+        row = bytearray()
+        for xx in range(w):
+            r, g, b = pixels[xx, yy]
+            row += bytes((b, g, r))
+        row += b"\x00" * pad
+        bmp += row
+    return bytes(bmp)
 
 
 # ---------------------------------------------------------------------------
 # Download helpers.
 # ---------------------------------------------------------------------------
 
-DEFAULT_TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+DEFAULT_STYLE = "streets-v2"
 DEFAULT_UA = "microReticulum-SAR-tile-fetcher/1.0 (contact: you@example.com)"
+
+
+def maptiler_url(style: str, z: int, x: int, y: int, api_key: str) -> str:
+    return "https://api.maptiler.com/maps/{}/{}/{}/{}.png?key={}".format(
+        style, z, x, y, api_key)
 
 
 def download_tile(url: str, ua: str, retries: int = 3) -> bytes:
@@ -91,6 +140,12 @@ def download_tile(url: str, ua: str, retries: int = 3) -> bytes:
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return resp.read()
+        except urllib.error.HTTPError as e:
+            # Don't retry auth failures or missing tiles.
+            if e.code in (401, 403):
+                raise
+            last_err = e
+            time.sleep(1.0 * (attempt + 1))
         except (urllib.error.URLError, OSError) as e:
             last_err = e
             time.sleep(1.0 * (attempt + 1))
@@ -99,8 +154,8 @@ def download_tile(url: str, ua: str, retries: int = 3) -> bytes:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Download XYZ tiles and save them as PNG "
-                    "for the microReticulum T-Deck SAR app.")
+        description="Download XYZ tiles from MapTiler and save them as 24-bit "
+                    "BMPs for the microReticulum T-Deck SAR app.")
     loc = parser.add_argument_group("location (one required)")
     loc.add_argument("--lat", type=float, help="centre latitude (with --lon)")
     loc.add_argument("--lon", type=float, help="centre longitude (with --lat)")
@@ -112,14 +167,19 @@ def main() -> int:
     parser.add_argument("--max-zoom", type=int, default=16)
     parser.add_argument("--out", default="./tiles",
                         help="output directory (copy to SD card root)")
-    parser.add_argument("--url", default=DEFAULT_TILE_URL,
-                        help="tile URL template with {z}/{x}/{y} placeholders")
+    parser.add_argument("--style", default=DEFAULT_STYLE,
+                        help="MapTiler style id (default: %(default)s)")
+    parser.add_argument("--api-key", required=True,
+                        help="MapTiler API key (required)")
     parser.add_argument("--user-agent", default=DEFAULT_UA)
     parser.add_argument("--overwrite", action="store_true",
                         help="re-fetch tiles that already exist")
     parser.add_argument("--delay", type=float, default=0.1,
                         help="delay between downloads (seconds)")
     args = parser.parse_args()
+
+    if not args.api_key:
+        parser.error("MapTiler API key required: pass --api-key")
 
     if args.lat is not None or args.lon is not None:
         if args.lat is None or args.lon is None:
@@ -143,6 +203,7 @@ def main() -> int:
 
     total_fetched = 0
     total_skipped = 0
+    total_failed = 0
 
     for zoom in range(args.min_zoom, args.max_zoom + 1):
         x0, x1, y0, y1 = bbox_tile_range(min_lat, min_lon, max_lat, max_lon,
@@ -151,33 +212,36 @@ def main() -> int:
             for ty in range(y0, y1 + 1):
                 out_dir = os.path.join(args.out, str(zoom), str(tx))
                 os.makedirs(out_dir, exist_ok=True)
-                out_path = os.path.join(out_dir, "{}.png".format(ty))
+                out_path = os.path.join(out_dir, "{}.bmp".format(ty))
 
                 if os.path.exists(out_path) and not args.overwrite:
                     total_skipped += 1
                     continue
 
-                url = args.url.format(z=zoom, x=tx, y=ty)
+                url = maptiler_url(args.style, zoom, tx, ty, args.api_key)
                 try:
-                    data = download_tile(url, args.user_agent)
+                    png_data = download_tile(url, args.user_agent)
+                    bmp_data = encode_24bit_bmp(png_data)
+                except urllib.error.HTTPError as e:
+                    print("  WARN: HTTP {} failed {}: {}".format(
+                        e.code, url, e.reason))
+                    total_failed += 1
+                    continue
                 except Exception as e:
                     print("  WARN: failed {}: {}".format(url, e))
+                    total_failed += 1
                     continue
 
-                if not png_is_256x256(data):
-                    print("  WARN: {} is not a 256x256 PNG; will still "
-                          "write (firmware assumes 256x256)".format(url))
-
                 with open(out_path, "wb") as f:
-                    f.write(data)
+                    f.write(bmp_data)
                 total_fetched += 1
-                print("  -> {}/{}".format(out_path, url))
+                print("  -> {} ({} bytes BMP)".format(out_path, len(bmp_data)))
 
                 if args.delay > 0:
                     time.sleep(args.delay)
 
-    print("\nDone: {} tiles written, {} already present (skipped).".format(
-        total_fetched, total_skipped))
+    print("\nDone: {} tiles written, {} already present (skipped), "
+          "{} failed.".format(total_fetched, total_skipped, total_failed))
     print("Copy the '{}' directory to the root of the SD card.".format(
         os.path.abspath(args.out)))
     return 0
